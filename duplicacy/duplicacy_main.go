@@ -24,7 +24,7 @@ import (
 
 	"io/ioutil"
 
-	"github.com/gilbertchen/duplicacy/src"
+	duplicacy "github.com/gilbertchen/duplicacy/src"
 )
 
 const (
@@ -41,6 +41,9 @@ func getRepositoryPreference(context *cli.Context, storageName string) (reposito
 	if err != nil {
 		duplicacy.LOG_ERROR("REPOSITORY_PATH", "Failed to retrieve the current working directory: %v", err)
 		return "", nil
+	}
+	if context.String("repository") != "" {
+		repository = context.String("repository")
 	}
 
 	for {
@@ -1043,7 +1046,6 @@ func printFile(context *cli.Context) {
 		snapshotID = context.String("id")
 	}
 
-
 	backupManager := duplicacy.CreateBackupManager(preference.SnapshotID, storage, repository, password, "", "", false)
 	duplicacy.SavePassword(*preference, "password", password)
 
@@ -1290,7 +1292,7 @@ func copySnapshots(context *cli.Context) {
 	destinationStorage.SetRateLimits(0, context.Int("upload-limit-rate"))
 
 	destinationManager := duplicacy.CreateBackupManager(destination.SnapshotID, destinationStorage, repository,
-		                                                  destinationPassword, "", "", false)
+		destinationPassword, "", "", false)
 	duplicacy.SavePassword(*destination, "password", destinationPassword)
 	destinationManager.SetupSnapshotCache(destination.Name)
 
@@ -1415,7 +1417,7 @@ func benchmark(context *cli.Context) {
 	if storage == nil {
 		return
 	}
-	duplicacy.Benchmark(repository, storage, int64(fileSize) * 1024 * 1024, chunkSize * 1024 * 1024, chunkCount, uploadThreads, downloadThreads)
+	duplicacy.Benchmark(repository, storage, int64(fileSize)*1024*1024, chunkSize*1024*1024, chunkCount, uploadThreads, downloadThreads)
 }
 
 func main() {
@@ -1454,8 +1456,8 @@ func main() {
 					Argument: "<level>",
 				},
 				cli.BoolFlag{
-					Name:     "zstd",
-					Usage:    "short for -zstd default",
+					Name:  "zstd",
+					Usage: "short for -zstd default",
 				},
 				cli.IntFlag{
 					Name:     "iterations",
@@ -1530,12 +1532,17 @@ func main() {
 					Argument: "<level>",
 				},
 				cli.BoolFlag{
-					Name:     "zstd",
-					Usage:    "short for -zstd default",
+					Name:  "zstd",
+					Usage: "short for -zstd default",
 				},
 				cli.BoolFlag{
 					Name:  "vss",
 					Usage: "enable the Volume Shadow Copy service (Windows and macOS using APFS only)",
+				},
+				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "specify the path of the repository (instead of the current working directory)",
+					Argument: "<path>",
 				},
 				cli.IntFlag{
 					Name:     "vss-timeout",
@@ -1564,7 +1571,6 @@ func main() {
 					Usage:    "the maximum number of entries kept in memory (defaults to 1M)",
 					Argument: "<number>",
 				},
-
 			},
 			Usage:     "Save a snapshot of the repository to the storage",
 			ArgsUsage: " ",
@@ -1621,10 +1627,15 @@ func main() {
 					Usage:    "the RSA private key to decrypt file chunks",
 					Argument: "<private key>",
 				},
+				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "specify the path of the repository (instead of the current working directory)",
+					Argument: "<path>",
+				},
 				cli.BoolFlag{
 					Name:  "persist",
 					Usage: "continue processing despite chunk errors or existing files (without -overwrite), reporting any affected files",
-        },
+				},
 				cli.StringFlag{
 					Name:     "key-passphrase",
 					Usage:    "the passphrase to decrypt the RSA private key",
@@ -1674,6 +1685,11 @@ func main() {
 					Name:     "storage",
 					Usage:    "retrieve snapshots from the specified storage",
 					Argument: "<storage name>",
+				},
+				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "specify the path of the repository (instead of the current working directory)",
+					Argument: "<path>",
 				},
 				cli.StringFlag{
 					Name:     "key",
@@ -1741,6 +1757,11 @@ func main() {
 					Argument: "<storage name>",
 				},
 				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "specify the path of the repository (instead of the current working directory)",
+					Argument: "<path>",
+				},
+				cli.StringFlag{
 					Name:     "key",
 					Usage:    "the RSA private key to decrypt file chunks",
 					Argument: "<private key>",
@@ -1782,6 +1803,11 @@ func main() {
 					Name:     "storage",
 					Usage:    "retrieve the file from the specified storage",
 					Argument: "<storage name>",
+				},
+				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "specify the path of the repository (instead of the current working directory)",
+					Argument: "<path>",
 				},
 				cli.StringFlag{
 					Name:     "key",
@@ -1922,6 +1948,11 @@ func main() {
 					Usage:    "prune snapshots from the specified storage",
 					Argument: "<storage name>",
 				},
+				cli.StringFlag{
+					Name:     "repository",
+					Usage:    "specify the path of the repository (instead of the current working directory)",
+					Argument: "<path>",
+				},
 				cli.IntFlag{
 					Name:     "threads",
 					Value:    1,
@@ -1982,8 +2013,8 @@ func main() {
 					Argument: "<level>",
 				},
 				cli.BoolFlag{
-					Name:     "zstd",
-					Usage:    "short for -zstd default",
+					Name:  "zstd",
+					Usage: "short for -zstd default",
 				},
 				cli.IntFlag{
 					Name:     "iterations",
@@ -2248,8 +2279,8 @@ func main() {
 			Usage: "add a comment to identify the process",
 		},
 		cli.StringSliceFlag{
-			Name:  "suppress, s",
-			Usage: "suppress logs with the specified id",
+			Name:     "suppress, s",
+			Usage:    "suppress logs with the specified id",
 			Argument: "<id>",
 		},
 		cli.BoolFlag{
