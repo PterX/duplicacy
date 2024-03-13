@@ -182,15 +182,29 @@ func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, 
 			return nil, nil, errWebDAVMovedPermanently
 		}
 
+		// if response.StatusCode == 302 {
+		// 	// redirect to location url
+		// 	redirect = true
+		// 	redirectUrl, err := response.Location()
+		// 	if err != nil {
+		// 		return nil, nil, errWebDAVMovedPermanently
+		// 	}
+		// 	uri = redirectUrl.String()
+		// }
+
 		if response.StatusCode == 404 {
 			// Retry if it is UPLOAD, otherwise return immediately
 			if method != "PUT" {
 				return nil, nil, errWebDAVNotExist
 			}
 		} else if response.StatusCode == 405 {
-			return nil, nil, errWebDAVMethodNotAllowed
+			if method == "MKCOL" {
+				return nil, nil, errWebDAVMethodNotAllowed
+			}
+			LOG_TRACE("WEBDAV_ERROR", "URL request '%s %s' returned an error (%v)", method, uri, err)
+			backoff = storage.retry(backoff)
+			continue
 		}
-		LOG_INFO("WEBDAV_RETRY", "URL request '%s %s' returned status code %d", method, uri, response.StatusCode)
 		backoff = storage.retry(backoff)
 	}
 	return nil, nil, errWebDAVMaximumBackoff
