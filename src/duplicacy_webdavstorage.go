@@ -434,14 +434,6 @@ func (storage *WebDAVStorage) CreateDirectory(threadIndex int, dir string) (err 
 	readCloser, _, err := storage.sendRequest("MKCOL", dir, 0, []byte(""))
 	if err != nil {
 		if err == errWebDAVMethodNotAllowed || err == errWebDAVMovedPermanently || err == io.EOF {
-			exist, _, _, infoerr := storage.GetFileInfo(threadIndex, dir)
-			// check if exist
-			if infoerr != nil {
-				return err
-			}
-			if !exist {
-				return err
-			}
 			LOG_TRACE("WEBDAV_MKDIR", "Can't create directory %s: %v; error ignored", dir, err)
 			storage.directoryCacheLock.Lock()
 			storage.directoryCache[dir] = 1
