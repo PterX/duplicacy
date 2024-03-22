@@ -117,7 +117,7 @@ func (storage *WebDAVStorage) retry(backoff int) int {
 func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, data []byte) (io.ReadCloser, http.Header, error) {
 
 	backoff := 1
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 10; i++ {
 
 		var dataReader io.Reader
 		headers := make(map[string]string)
@@ -198,12 +198,7 @@ func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, 
 				return nil, nil, errWebDAVNotExist
 			}
 		} else if response.StatusCode == 405 {
-			if method == "MKCOL" {
-				return nil, nil, errWebDAVMethodNotAllowed
-			}
-			LOG_TRACE("WEBDAV_ERROR", "URL request '%s %s' returned an error (%v)", method, uri, err)
-			backoff = storage.retry(backoff)
-			continue
+			return nil, nil, errWebDAVMethodNotAllowed
 		}
 		backoff = storage.retry(backoff)
 	}
@@ -439,7 +434,14 @@ func (storage *WebDAVStorage) CreateDirectory(threadIndex int, dir string) (err 
 	readCloser, _, err := storage.sendRequest("MKCOL", dir, 0, []byte(""))
 	if err != nil {
 		if err == errWebDAVMethodNotAllowed || err == errWebDAVMovedPermanently || err == io.EOF {
-			// We simply ignore these errors and assume that the directory already exists
+			exist, _, _, infoerr := storage.GetFileInfo(threadIndex, dir)
+			// check if exist
+			if infoerr != nil {
+				return err
+			}
+			if !exist {
+				return err
+			}
 			LOG_TRACE("WEBDAV_MKDIR", "Can't create directory %s: %v; error ignored", dir, err)
 			storage.directoryCacheLock.Lock()
 			storage.directoryCache[dir] = 1
@@ -476,7 +478,18 @@ func (storage *WebDAVStorage) UploadFile(threadIndex int, filePath string, conte
 
 	readCloser, _, err := storage.sendRequest("PUT", filePath, 0, content)
 	if err != nil {
-		return err
+		// maybe already uploaded
+		if err == errWebDAVMethodNotAllowed {
+			exist, _, size, infoerr := storage.GetFileInfo(threadIndex, filePath)
+			if infoerr != nil {
+				return err
+			}
+			if !exist {
+				return err
+			}
+			LOG_INFO("debug", "upload error uploaded_size:%d srouce_size:%d", size, len(content))
+			return nil
+		}
 	}
 	io.Copy(ioutil.Discard, readCloser)
 	readCloser.Close()
