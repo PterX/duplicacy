@@ -117,6 +117,7 @@ func (storage *WebDAVStorage) retry(backoff int) int {
 func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, data []byte) (io.ReadCloser, http.Header, error) {
 
 	backoff := 1
+	sendError := errWebDAVMaximumBackoff
 	for i := 0; i < 10; i++ {
 
 		var dataReader io.Reader
@@ -194,15 +195,20 @@ func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, 
 
 		if response.StatusCode == 404 {
 			// Retry if it is UPLOAD, otherwise return immediately
+			sendError = errWebDAVNotExist
 			if method != "PUT" {
 				return nil, nil, errWebDAVNotExist
 			}
 		} else if response.StatusCode == 405 {
-			return nil, nil, errWebDAVMethodNotAllowed
+			sendError = errWebDAVMethodNotAllowed
+			if method != "PUT" {
+				return nil, nil, errWebDAVMethodNotAllowed
+			}
 		}
 		backoff = storage.retry(backoff)
 	}
-	return nil, nil, errWebDAVMaximumBackoff
+	LOG_WARN("WEBDAV_RETRY", "Retry max %v", sendError)
+	return nil, nil, sendError
 }
 
 type WebDAVProperties map[string]string
@@ -473,14 +479,14 @@ func (storage *WebDAVStorage) UploadFile(threadIndex int, filePath string, conte
 		// maybe already uploaded
 		if err == errWebDAVMethodNotAllowed {
 			exist, _, size, infoerr := storage.GetFileInfo(threadIndex, filePath)
+			LOG_ERROR("UPLOAD_CHUNK", "upload error uploaded_size:%d srouce_size:%d exist:%v error:%v", size, len(content), exist, infoerr)
 			if infoerr != nil {
 				return err
 			}
 			if !exist {
 				return err
 			}
-			LOG_INFO("debug", "upload error uploaded_size:%d srouce_size:%d", size, len(content))
-			return nil
+			return err
 		}
 	}
 	io.Copy(ioutil.Discard, readCloser)
