@@ -118,7 +118,7 @@ func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, 
 
 	backoff := 1
 	sendError := errWebDAVMaximumBackoff
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 
 		var dataReader io.Reader
 		headers := make(map[string]string)
