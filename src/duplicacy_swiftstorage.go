@@ -6,6 +6,8 @@ package duplicacy
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -237,6 +239,35 @@ func (storage *SwiftStorage) DownloadFile(threadIndex int, filePath string, chun
 	if err != nil {
 		return err
 	}
+	defer file.Close()
+	_, err = RateLimitedCopy(chunk, file, storage.DownloadRateLimit/storage.threads)
+	return err
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *SwiftStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	if offset <= 0 {
+		return storage.DownloadFile(threadIndex, filePath, chunk)
+	}
+
+	headers := swift.Headers{
+		"Range": fmt.Sprintf("bytes=%d-", offset),
+	}
+	file, respHeaders, err := storage.connection.ObjectOpen(storage.ctx, storage.container, storage.storageDir+filePath, false, headers)
+	if err != nil {
+		if e, ok := err.(*swift.Error); ok && e.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return ErrRangeNotSatisfiable
+		}
+		return err
+	}
+
+	defer file.Close()
+
+	contentRange := respHeaders["Content-Range"]
+	if contentRange == "" || !isValidContentRange(contentRange, offset) {
+		return ErrRangeNotSupported
+	}
+
 	_, err = RateLimitedCopy(chunk, file, storage.DownloadRateLimit/storage.threads)
 	return err
 }

@@ -41,6 +41,16 @@ type BackupManager struct {
 	excludeByAttribute bool // don't backup file based on file attribute
 
 	cachePath string
+
+	cacheDataChunks bool // Whether to cache downloaded data chunks in the local cache
+}
+
+// SetDataChunkCaching enables or disables the local data chunk cache.  When enabled, every data chunk
+// downloaded from the storage is also saved to the local cache directory (~/.duplicacy/cache), and
+// subsequent runs load the chunks locally instead of downloading them again.  Note that the cached
+// chunks are stored unencrypted.
+func (manager *BackupManager) SetDataChunkCaching(enabled bool) {
+	manager.cacheDataChunks = enabled
 }
 
 func (manager *BackupManager) SetDryRun(dryRun bool) {
@@ -680,6 +690,17 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 	localListingChannel := make(chan *Entry)
 	remoteListingChannel := make(chan *Entry)
 	chunkOperator := CreateChunkOperator(manager.config, manager.storage, manager.snapshotCache, showStatistics, false, threads, allowFailures)
+	if manager.cacheDataChunks {
+		if manager.snapshotCache == nil {
+			LOG_WARN("RESTORE_CACHE", "The local chunk cache is not available; all chunks will be downloaded from the storage")
+		} else {
+			if err := os.Chmod(manager.cachePath, 0700); err != nil {
+				LOG_WARN("RESTORE_CACHE", "Failed to restrict permissions on local cache directory %s: %v", manager.cachePath, err)
+			}
+			chunkOperator.EnableDataChunkCache()
+			LOG_INFO("RESTORE_CACHE", "The local chunk cache is enabled; downloaded chunks will be cached under %s", manager.cachePath)
+		}
+	}
 
 	LOG_INFO("RESTORE_INDEXING", "Indexing %s", top)
 	go func() {
@@ -812,6 +833,10 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 
 	// For small files that span only one chunk, use the first chunk instead
 	for _, file := range fileEntries {
+		// Zero-size files don't have any chunks; they are handled by the download loop below
+		if file.Size == 0 {
+			continue
+		}
 		if file.StartChunk == file.EndChunk {
 			first := chunkMap[remoteSnapshot.ChunkHashes[file.StartChunk]]
 			file.StartChunk = first

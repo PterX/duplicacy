@@ -215,6 +215,20 @@ func (storage *B2Storage) DownloadFile(threadIndex int, filePath string, chunk *
 	return err
 }
 
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *B2Storage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+
+	readCloser, _, err := storage.client.DownloadFileRange(threadIndex, filePath, offset)
+	if err != nil {
+		return err
+	}
+
+	defer readCloser.Close()
+
+	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/storage.client.Threads)
+	return err
+}
+
 // UploadFile writes 'content' to the file at 'filePath'.
 func (storage *B2Storage) UploadFile(threadIndex int, filePath string, content []byte) (err error) {
 	return storage.client.UploadFile(threadIndex, filePath, content, storage.UploadRateLimit/storage.client.Threads)

@@ -6,6 +6,7 @@ package duplicacy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -77,6 +78,32 @@ type Storage interface {
 
 	// Set the maximum transfer speeds.
 	SetRateLimits(downloadRateLimit int, uploadRateLimit int)
+}
+
+// ErrRangeNotSupported is returned by RangeDownloadStorage.DownloadFileRange when the storage
+// ignores the Range request (for example, returning HTTP 200 instead of 206 Partial Content).
+var ErrRangeNotSupported = errors.New("server does not support range downloads")
+
+// ErrRangeNotSatisfiable is returned by RangeDownloadStorage.DownloadFileRange when the requested
+// byte offset is at or past the end of the remote file (HTTP 416 Range Not Satisfiable).
+var ErrRangeNotSatisfiable = errors.New("requested range not satisfiable")
+
+// isValidContentRange checks whether an HTTP Content-Range header (if present) starts at the
+// requested byte offset.
+func isValidContentRange(contentRange string, offset int64) bool {
+	if contentRange == "" {
+		return true
+	}
+	return strings.HasPrefix(contentRange, fmt.Sprintf("bytes %d-", offset))
+}
+
+// RangeDownloadStorage is an optional interface that may be implemented by storages that support
+// downloading only a range of a file, so that an interrupted download can be resumed from the byte
+// where it left off instead of being restarted from the beginning.
+type RangeDownloadStorage interface {
+	// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from
+	// 'offset'.  A nil error means the entire tail of the file has been appended.
+	DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error)
 }
 
 // These are the top-level directories where chunks are stored.  Normally every chunk goes under 'chunks', but
@@ -244,6 +271,7 @@ func (storage *StorageBase) findChunkUnderDirectory(threadIndex int, chunkID str
 	}
 
 	chunkPaths := make([]string, 0)
+	var lastErr error
 	for _, level := range readLevels {
 		chunkPath := topDir
 		for i := 0; i < level; i++ {
@@ -257,7 +285,13 @@ func (storage *StorageBase) findChunkUnderDirectory(threadIndex int, chunkID str
 		if err == nil && exist {
 			return chunkPath, exist, size, err
 		}
+		if err != nil {
+			lastErr = err
+		}
 		chunkPaths = append(chunkPaths, chunkPath)
+	}
+	if lastErr != nil {
+		return "", false, 0, lastErr
 	}
 	for i, level := range readLevels {
 		if writeLevel == level {

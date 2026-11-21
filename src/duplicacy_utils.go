@@ -7,12 +7,15 @@ package duplicacy
 import (
 	"bufio"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"runtime"
 
@@ -53,6 +56,55 @@ func IsEmptyFilter(pattern string) bool {
 	} else {
 		return false
 	}
+}
+
+// IsTransientNetworkError returns true if the error is likely to be caused by a transient network
+// failure rather than a permanent condition, in which case the operation can be retried.
+func IsTransientNetworkError(err error) bool {
+
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+
+	// net.OpError, os.SyscallError, and friends implement net.Error for timeouts and
+	// connection-level failures.
+	var networkError net.Error
+	if errors.As(err, &networkError) {
+		return true
+	}
+
+	// Some SDKs wrap the underlying transport error in a plain error, so fall back to
+	// matching well-known phrases.
+	lower := strings.ToLower(err.Error())
+	for _, keyword := range []string{
+		"unexpected eof",
+		"connection reset",
+		"connection closed",
+		"broken pipe",
+		"i/o timeout",
+		"timed out",
+		"timeout awaiting response headers",
+		"temporary failure in name resolution",
+		"no such host",
+		"stream error",
+		"http2: server sent goaway",
+	} {
+		if strings.Contains(lower, keyword) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func IsUnspecifiedFilter(pattern string) bool {

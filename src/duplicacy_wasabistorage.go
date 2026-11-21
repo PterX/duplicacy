@@ -164,6 +164,13 @@ func (storage *WasabiStorage) DownloadFile(
 	return storage.s3.DownloadFile(threadIndex, filePath, chunk)
 }
 
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *WasabiStorage) DownloadFileRange(
+	threadIndex int, filePath string, offset int64, chunk *Chunk,
+) (err error) {
+	return storage.s3.DownloadFileRange(threadIndex, filePath, offset, chunk)
+}
+
 func (storage *WasabiStorage) UploadFile(
 	threadIndex int, filePath string, content []byte,
 ) (err error) {

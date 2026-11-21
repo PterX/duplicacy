@@ -5,11 +5,15 @@
 package duplicacy
 
 import (
-	"io"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// downloadRetryDelay is the base unit of backoff between download retries and resumes.
+// Tests may override this to avoid real sleeps.
+var downloadRetryDelay = time.Second
 
 // These are operations that ChunkOperator will perform.
 const (
@@ -56,6 +60,7 @@ type ChunkOperator struct {
 	downloadedChunkSize int64    // Downloaded chunk size
 
 	allowFailures bool           // Whether to fail on download error, or continue
+	cacheDataChunks bool         // Whether to cache downloaded data chunks in the snapshot cache
 	NumberOfFailedChunks int64   // The number of chunks that can't be downloaded
 
 	rewriteChunks bool           // Whether to rewrite corrupted chunks when erasure coding is enabled
@@ -99,6 +104,13 @@ func CreateChunkOperator(config *Config, storage Storage, snapshotCache *FileSto
 	}
 
 	return operator
+}
+
+// EnableDataChunkCache enables caching of downloaded data chunks in the local snapshot cache, so
+// that subsequent runs can load them locally instead of downloading them from the storage again.
+// Note that the cached chunks are stored unencrypted.
+func (operator *ChunkOperator) EnableDataChunkCache() {
+	operator.cacheDataChunks = true
 }
 
 func (operator *ChunkOperator) Stop() {
@@ -312,7 +324,9 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		}
 	} ()
 
-	if task.isMetadata && operator.snapshotCache != nil && !task.skipCache {
+	// The local cache is always used for metadata chunks.  For data chunks it is only used when
+	// explicitly enabled, because it stores the chunks unencrypted on the local disk.
+	if (task.isMetadata || operator.cacheDataChunks) && operator.snapshotCache != nil && !task.skipCache {
 
 		var exist bool
 		var err error
@@ -326,14 +340,23 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		} else if exist {
 			err = operator.snapshotCache.DownloadFile(0, cachedPath, chunk)
 			if err != nil {
-				LOG_WARN("DOWNLOAD_CACHE", "Failed to load the chunk %s from the snapshot cache: %v", chunkID, err)
+				LOG_WARN("DOWNLOAD_CACHE", "Failed to load the chunk %s from the local cache: %v", chunkID, err)
 			} else {
 				actualChunkID := chunk.GetID()
 				if actualChunkID != chunkID {
 					LOG_WARN("DOWNLOAD_CACHE_CORRUPTED",
-						"The chunk %s load from the snapshot cache has a hash id of %s", chunkID, actualChunkID)
+						"The chunk %s loaded from the local cache has a hash id of %s", chunkID, actualChunkID)
+					// Remove the corrupted cache file so that it won't be loaded again
+					operator.snapshotCache.DeleteFile(threadIndex, cachedPath)
 				} else {
-					LOG_DEBUG("CHUNK_CACHE", "Chunk %s has been loaded from the snapshot cache", chunkID)
+					LOG_DEBUG("CHUNK_CACHE", "Chunk %s has been loaded from the local cache", chunkID)
+
+					// A data chunk loaded from the local cache counts as downloaded so that the
+					// progress percentage keeps advancing and can reach 100% (metadata chunks are
+					// excluded from totalChunkSize during restore).
+					if !task.isMetadata {
+						atomic.AddInt64(&operator.downloadedChunkSize, int64(chunk.GetLength()))
+					}
 
 					task.completionFunc(chunk, task.chunkIndex)
 					chunk = nil
@@ -363,6 +386,8 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 	filePath := ""
 
 	const MaxDownloadAttempts = 3
+	const MaxStalledResumes = 3
+	const MaxTotalResumes = 16
 	for downloadAttempt := 0; ; downloadAttempt++ {
 
 		exist := false
@@ -371,6 +396,11 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		// Find the chunk by ID first.
 		chunkPath, exist, _, err = operator.storage.FindChunk(threadIndex, chunkID, false, task.isMetadata)
 		if err != nil {
+			if IsTransientNetworkError(err) && downloadAttempt < MaxDownloadAttempts {
+				LOG_WARN("DOWNLOAD_RETRY", "Failed to find the chunk %s: %v; retrying", chunkID, err)
+				time.Sleep(time.Duration(downloadAttempt+1) * downloadRetryDelay)
+				continue
+			}
 			completeFailedChunk()
 			LOG_WERROR(operator.allowFailures, "DOWNLOAD_CHUNK", "Failed to find the chunk %s: %v", chunkID, err)
 			return
@@ -382,6 +412,11 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 			// No chunk is found.  Have to find it in the fossil pool again.
 			fossilPath, exist, _, err = operator.storage.FindChunk(threadIndex, chunkID, true, task.isMetadata)
 			if err != nil {
+				if IsTransientNetworkError(err) && downloadAttempt < MaxDownloadAttempts {
+					LOG_WARN("DOWNLOAD_RETRY", "Failed to find the fossil of the chunk %s: %v; retrying", chunkID, err)
+					time.Sleep(time.Duration(downloadAttempt+1) * downloadRetryDelay)
+					continue
+				}
 				completeFailedChunk()
 				LOG_WERROR(operator.allowFailures, "DOWNLOAD_CHUNK", "Failed to find the chunk %s: %v", chunkID, err)
 				return
@@ -421,17 +456,64 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 
 		err = operator.storage.DownloadFile(threadIndex, filePath, chunk)
 		if err != nil {
-			_, isHubic := operator.storage.(*HubicStorage)
-			// Retry on EOF or if it is a Hubic backend as it may return 404 even when the chunk exists
-			if (err == io.ErrUnexpectedEOF || isHubic) && downloadAttempt < MaxDownloadAttempts {
-				LOG_WARN("DOWNLOAD_RETRY", "Failed to download the chunk %s: %v; retrying", chunkID, err)
-				chunk.Reset(false)
-				chunk.isMetadata = task.isMetadata
-				continue
-			} else {
-				completeFailedChunk()
-				LOG_WERROR(operator.allowFailures, "DOWNLOAD_CHUNK", "Failed to download the chunk %s: %v", chunkID, err)
-				return
+			// Some bytes may have been received before the failure.  If the storage supports ranged
+			// downloads and the error is transient, keep resuming from where it left off.
+			resumed := false
+			rangeUnsupported := false
+			if chunk.GetLength() > 0 && (IsTransientNetworkError(err) || err == errWebDAVMaximumBackoff) {
+				if resumableStorage, ok := operator.storage.(RangeDownloadStorage); ok {
+					stalledResumes := 0
+					for totalResumes := 0; totalResumes < MaxTotalResumes && stalledResumes < MaxStalledResumes; totalResumes++ {
+						offset := int64(chunk.GetLength())
+						LOG_WARN("DOWNLOAD_RESUME", "Failed to download the chunk %s: %v; resuming from byte %d",
+							chunkID, err, offset)
+						time.Sleep(time.Duration(stalledResumes+1) * downloadRetryDelay)
+
+						err = resumableStorage.DownloadFileRange(threadIndex, filePath, offset, chunk)
+						if err == nil {
+							resumed = true
+							break
+						}
+						if errors.Is(err, ErrRangeNotSatisfiable) {
+							// All bytes may already have been received before a trailing read error;
+							// let decryption and hash verification decide if the chunk is complete.
+							resumed = true
+							err = nil
+							break
+						}
+						if errors.Is(err, ErrRangeNotSupported) {
+							LOG_WARN("DOWNLOAD_RESUME", "Storage does not support range downloads for chunk %s; falling back to full retry", chunkID)
+							rangeUnsupported = true
+							break
+						}
+						if !IsTransientNetworkError(err) && err != errWebDAVMaximumBackoff {
+							break
+						}
+						if int64(chunk.GetLength()) > offset {
+							// Forward progress was made; reset consecutive stalled count
+							stalledResumes = 0
+						} else {
+							stalledResumes++
+						}
+					}
+				}
+			}
+
+			if !resumed {
+				_, isHubic := operator.storage.(*HubicStorage)
+				// Retry on transient network errors, unsupported range fallback, or if it is a
+				// Hubic/WebDAV backend as its requests may fail even when the chunk exists
+				if (rangeUnsupported || IsTransientNetworkError(err) || isHubic || err == errWebDAVMaximumBackoff) && downloadAttempt < MaxDownloadAttempts {
+					LOG_WARN("DOWNLOAD_RETRY", "Failed to download the chunk %s: %v; retrying", chunkID, err)
+					chunk.Reset(false)
+					chunk.isMetadata = task.isMetadata
+					time.Sleep(time.Duration(downloadAttempt+1) * downloadRetryDelay)
+					continue
+				} else {
+					completeFailedChunk()
+					LOG_WERROR(operator.allowFailures, "DOWNLOAD_CHUNK", "Failed to download the chunk %s: %v", chunkID, err)
+					return
+				}
 			}
 		}
 
@@ -442,6 +524,7 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 				LOG_WARN("DOWNLOAD_RETRY", "Failed to decrypt the chunk %s: %v; retrying", chunkID, err)
 				chunk.Reset(false)
 				chunk.isMetadata = task.isMetadata
+				time.Sleep(time.Duration(downloadAttempt+1) * downloadRetryDelay)
 				continue
 			} else {
 				completeFailedChunk()
@@ -456,6 +539,7 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 				LOG_WARN("DOWNLOAD_RETRY", "The chunk %s has a hash id of %s; retrying", chunkID, actualChunkID)
 				chunk.Reset(false)
 				chunk.isMetadata = task.isMetadata
+				time.Sleep(time.Duration(downloadAttempt+1) * downloadRetryDelay)
 				continue
 			} else {
 				completeFailedChunk()
@@ -499,11 +583,11 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		break
 	}
 
-	if chunk.isMetadata && len(cachedPath) > 0 {
-		// Save a copy to the local snapshot cache
+	if (chunk.isMetadata || operator.cacheDataChunks) && len(cachedPath) > 0 {
+		// Save a copy to the local cache
 		err := operator.snapshotCache.UploadFile(threadIndex, cachedPath, chunk.GetBytes())
 		if err != nil {
-			LOG_WARN("DOWNLOAD_CACHE", "Failed to add the chunk %s to the snapshot cache: %v", chunkID, err)
+			LOG_WARN("DOWNLOAD_CACHE", "Failed to add the chunk %s to the local cache: %v", chunkID, err)
 		}
 	}
 

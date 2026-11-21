@@ -159,9 +159,29 @@ func (storage *SambaStorage) DownloadFile(threadIndex int, filePath string, chun
 	if _, err = RateLimitedCopy(chunk, file, storage.DownloadRateLimit/storage.numberOfThreads); err != nil {
 		return err
 	}
-
 	return nil
+}
 
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *SambaStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+
+	file, err := storage.share.Open(path.Join(storage.storageDir, filePath))
+
+	if err != nil {
+		return err
+	}
+
+	defer file.Close()
+
+	if offset > 0 {
+		if _, err = file.Seek(offset, io.SeekStart); err != nil {
+			return err
+		}
+	}
+	if _, err = RateLimitedCopy(chunk, file, storage.DownloadRateLimit/storage.numberOfThreads); err != nil {
+		return err
+	}
+	return nil
 }
 
 // UploadFile writes 'content' to the file at 'filePath'

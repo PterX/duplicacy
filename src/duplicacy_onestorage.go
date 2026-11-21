@@ -236,6 +236,19 @@ func (storage *OneDriveStorage) DownloadFile(threadIndex int, filePath string, c
 	return err
 }
 
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *OneDriveStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	readCloser, _, err := storage.client.DownloadFileRange(storage.storageDir + "/" + storage.convertFilePath(filePath), offset)
+	if err != nil {
+		return err
+	}
+
+	defer readCloser.Close()
+
+	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/storage.numberOfThread)
+	return err
+}
+
 // UploadFile writes 'content' to the file at 'filePath'.
 func (storage *OneDriveStorage) UploadFile(threadIndex int, filePath string, content []byte) (err error) {
 	err = storage.client.UploadFile(storage.storageDir+"/"+filePath, content, storage.UploadRateLimit/storage.numberOfThread)

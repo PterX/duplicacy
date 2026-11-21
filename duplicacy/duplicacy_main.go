@@ -887,6 +887,7 @@ func restoreRepository(context *cli.Context) {
 	loadRSAPrivateKey(context.String("key"), context.String("key-passphrase"), preference, backupManager, false)
 
 	backupManager.SetupSnapshotCache(preference.Name)
+	backupManager.SetDataChunkCaching(context.Bool("chunk-cache"))
 	failed := backupManager.Restore(repository, revision, true, quickMode, threads, overwrite, deleteMode, setOwner, showStatistics, patterns, persist)
 	if failed > 0 {
 		duplicacy.LOG_ERROR("RESTORE_FAIL", "%d file(s) were not restored correctly", failed)
@@ -1630,6 +1631,10 @@ func main() {
 					Name:     "key-passphrase",
 					Usage:    "the passphrase to decrypt the RSA private key",
 					Argument: "<private key passphrase>",
+				},
+				cli.BoolFlag{
+					Name:  "chunk-cache",
+					Usage: "cache downloaded chunks locally (.duplicacy/cache) so that a re-run doesn't need to download them again (chunks are cached unencrypted)",
 				},
 			},
 			Usage:     "Restore the repository to a previously saved snapshot",

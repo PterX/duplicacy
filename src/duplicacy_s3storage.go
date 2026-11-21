@@ -10,6 +10,8 @@
 package duplicacy
 
 import (
+	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 
@@ -209,6 +211,37 @@ func (storage *S3Storage) DownloadFile(threadIndex int, filePath string, chunk *
 	}
 
 	defer output.Body.Close()
+
+	_, err = RateLimitedCopy(chunk, output.Body, storage.DownloadRateLimit/storage.numberOfThreads)
+	return err
+
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *S3Storage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	if offset <= 0 {
+		return storage.DownloadFile(threadIndex, filePath, chunk)
+	}
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(storage.bucket),
+		Key:    aws.String(storage.storageDir + filePath),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-", offset)),
+	}
+
+	output, err := storage.client.GetObject(input)
+	if err != nil {
+		if e, ok := err.(awserr.RequestFailure); ok && e.StatusCode() == http.StatusRequestedRangeNotSatisfiable {
+			return ErrRangeNotSatisfiable
+		}
+		return err
+	}
+
+	defer output.Body.Close()
+
+	if output.ContentRange == nil || !isValidContentRange(*output.ContentRange, offset) {
+		return ErrRangeNotSupported
+	}
 
 	_, err = RateLimitedCopy(chunk, output.Body, storage.DownloadRateLimit/storage.numberOfThreads)
 	return err

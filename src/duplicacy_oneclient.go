@@ -103,6 +103,10 @@ func NewOneDriveClient(tokenFile string, isBusiness bool, client_id string, clie
 }
 
 func (client *OneDriveClient) call(url string, method string, input interface{}, contentType string) (io.ReadCloser, int64, error) {
+	return client.callWithRange(url, method, input, contentType, "")
+}
+
+func (client *OneDriveClient) callWithRange(url string, method string, input interface{}, contentType string, rangeHeader string) (io.ReadCloser, int64, error) {
 
 	var response *http.Response
 
@@ -139,6 +143,10 @@ func (client *OneDriveClient) call(url string, method string, input interface{},
 		if reader, ok := inputReader.(*RateLimitedReader); ok {
 			request.ContentLength = reader.Length()
 			request.Header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", reader.Length() - 1, reader.Length()))
+		}
+
+		if rangeHeader != "" {
+			request.Header.Set("Range", rangeHeader)
 		}
 
 		if url != client.RefreshTokenURL {
@@ -179,6 +187,10 @@ func (client *OneDriveClient) call(url string, method string, input interface{},
 		client.IsConnected = true
 
 		if response.StatusCode < 400 {
+			if rangeHeader != "" && response.StatusCode != http.StatusPartialContent {
+				response.Body.Close()
+				return nil, 0, ErrRangeNotSupported
+			}
 			return response.Body, response.ContentLength, nil
 		}
 
@@ -201,6 +213,8 @@ func (client *OneDriveClient) call(url string, method string, input interface{},
 			continue
 		} else if response.StatusCode == 409 {
 			return nil, 0, OneDriveError{Status: response.StatusCode, Message: "Conflict"}
+		} else if response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return nil, 0, ErrRangeNotSatisfiable
 		} else if response.StatusCode > 401 && response.StatusCode != 404 {
 			delay := int((rand.Float32() * 0.5 + 0.5) * 1000.0 * float32(backoff))
 			if backoffList, found := response.Header["Retry-After"]; found && len(backoffList) > 0 {
@@ -355,6 +369,17 @@ func (client *OneDriveClient) DownloadFile(path string) (io.ReadCloser, int64, e
 	url := client.APIURL + "/items/root:/" + path + ":/content"
 
 	return client.call(url, "GET", 0, "")
+}
+
+// DownloadFileRange downloads the file at 'path' starting from 'offset'.
+func (client *OneDriveClient) DownloadFileRange(path string, offset int64) (io.ReadCloser, int64, error) {
+	if offset <= 0 {
+		return client.DownloadFile(path)
+	}
+
+	url := client.APIURL + "/items/root:/" + path + ":/content"
+
+	return client.callWithRange(url, "GET", 0, "", fmt.Sprintf("bytes=%d-", offset))
 }
 
 func (client *OneDriveClient) UploadFile(path string, content []byte, rateLimit int) (err error) {

@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -243,6 +244,24 @@ func (storage *GCSStorage) GetFileInfo(threadIndex int, filePath string) (exist 
 func (storage *GCSStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
 	readCloser, err := storage.bucket.Object(storage.storageDir + filePath).NewReader(context.Background())
 	if err != nil {
+		return err
+	}
+	defer readCloser.Close()
+	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/storage.numberOfThreads)
+	return err
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *GCSStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	if offset <= 0 {
+		return storage.DownloadFile(threadIndex, filePath, chunk)
+	}
+
+	readCloser, err := storage.bucket.Object(storage.storageDir + filePath).NewRangeReader(context.Background(), offset, -1)
+	if err != nil {
+		if e, ok := err.(*googleapi.Error); ok && e.Code == http.StatusRequestedRangeNotSatisfiable {
+			return ErrRangeNotSatisfiable
+		}
 		return err
 	}
 	defer readCloser.Close()

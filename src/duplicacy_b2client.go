@@ -144,6 +144,12 @@ func (client *B2Client) retry(retries int, response *http.Response) int {
 
 func (client *B2Client) call(threadIndex int, requestURL string, method string, requestHeaders map[string]string, input interface{}) (
 	                         io.ReadCloser, http.Header, int64, error) {
+	body, header, length, _, err := client.callWithStatus(threadIndex, requestURL, method, requestHeaders, input)
+	return body, header, length, err
+}
+
+func (client *B2Client) callWithStatus(threadIndex int, requestURL string, method string, requestHeaders map[string]string, input interface{}) (
+	                         io.ReadCloser, http.Header, int64, int, error) {
 
 	var response *http.Response
 
@@ -156,7 +162,7 @@ func (client *B2Client) call(threadIndex int, requestURL string, method string, 
 		default:
 			jsonInput, err := json.Marshal(input)
 			if err != nil {
-				return nil, nil, 0, err
+				return nil, nil, 0, 0, err
 			}
 			inputReader = bytes.NewReader(jsonInput)
 		case int:
@@ -176,7 +182,7 @@ func (client *B2Client) call(threadIndex int, requestURL string, method string, 
 			if client.UploadURLs[threadIndex] == "" || client.UploadTokens[threadIndex] == "" {
 				err := client.getUploadURL(threadIndex)
 				if err != nil {
-					return nil, nil, 0, err
+					return nil, nil, 0, 0, err
 				}
 			}
 			requestURL = client.UploadURLs[threadIndex]
@@ -184,7 +190,7 @@ func (client *B2Client) call(threadIndex int, requestURL string, method string, 
 
 		request, err := http.NewRequest(method, requestURL, inputReader)
 		if err != nil {
-			return nil, nil, 0, err
+			return nil, nil, 0, 0, err
 		}
 
 		if requestURL == B2AuthorizationURL {
@@ -220,14 +226,14 @@ func (client *B2Client) call(threadIndex int, requestURL string, method string, 
 
 			// Don't retry when the first authorization request fails
 			if requestURL == B2AuthorizationURL && !client.IsAuthorized {
-				return nil, nil, 0, err
+				return nil, nil, 0, 0, err
 			}
 
 			LOG_TRACE("BACKBLAZE_CALL", "[%d] URL request '%s' returned an error: %v", threadIndex, requestURL, err)
 
 			retries = client.retry(retries, response)
 			if retries <= 0 {
-				return nil, nil, 0, err
+				return nil, nil, 0, 0, err
 			}
 
 			// Clear the upload url to requrest a new one on retry
@@ -240,7 +246,7 @@ func (client *B2Client) call(threadIndex int, requestURL string, method string, 
 		}
 
 		if response.StatusCode < 300 {
-			return response.Body, response.Header, response.ContentLength, nil
+			return response.Body, response.Header, response.ContentLength, response.StatusCode, nil
 		}
 
 		e := &B2Error{}
@@ -254,13 +260,13 @@ func (client *B2Client) call(threadIndex int, requestURL string, method string, 
 
 		if response.StatusCode == 401 {
 			if requestURL == B2AuthorizationURL {
-				return nil, nil, 0, fmt.Errorf("Authorization failure")
+				return nil, nil, 0, response.StatusCode, fmt.Errorf("Authorization failure")
 			}
 
 			// The application key isn't allowed to make this request (e.g. it is restricted to other buckets or to a
 			// different file name prefix), so authorizing again won't help
 			if e.Code == "unauthorized" {
-				return nil, nil, 0, fmt.Errorf("URL request '%s' returned %d %s", requestURL, response.StatusCode, e.Message)
+				return nil, nil, 0, response.StatusCode, fmt.Errorf("URL request '%s' returned %d %s", requestURL, response.StatusCode, e.Message)
 			}
 
 			// Attempt authorization again.  If authorization is actually not done, run the random backoff
@@ -270,23 +276,24 @@ func (client *B2Client) call(threadIndex int, requestURL string, method string, 
 			}
 		} else if response.StatusCode == 403 {
 			if !client.TestMode {
-				return nil, nil, 0, fmt.Errorf("B2 cap exceeded")
+				return nil, nil, 0, response.StatusCode, fmt.Errorf("B2 cap exceeded")
 			}
 			continue
 		} else if response.StatusCode == 404 {
 			if http.MethodHead == method {
-				return nil, nil, 0, nil
+				return nil, nil, 0, response.StatusCode, nil
 			}
-		} else if response.StatusCode == 416 {
+		} else if response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
 			if http.MethodHead == method {
 				// 416 Requested Range Not Satisfiable
-				return nil, nil, 0, fmt.Errorf("URL request '%s' returned %d %s", requestURL, response.StatusCode, e.Message)
+				return nil, nil, 0, response.StatusCode, fmt.Errorf("URL request '%s' returned %d %s", requestURL, response.StatusCode, e.Message)
 			}
+			return nil, nil, 0, response.StatusCode, ErrRangeNotSatisfiable
 		}
 
 		retries = client.retry(retries, response)
 		if retries <= 0 {
-			return nil, nil, 0, fmt.Errorf("URL request '%s' returned %d %s", requestURL, response.StatusCode, e.Message)
+			return nil, nil, 0, response.StatusCode, fmt.Errorf("URL request '%s' returned %d %s", requestURL, response.StatusCode, e.Message)
 		}
 
 		if isUpload {
@@ -594,29 +601,47 @@ func (client *B2Client) HideFile(threadIndex int, fileName string) (fileID strin
 }
 
 func (client *B2Client) DownloadFile(threadIndex int, filePath string) (io.ReadCloser, int64, error) {
+	return client.DownloadFileRange(threadIndex, filePath, 0)
+}
 
+// DownloadFileRange downloads the file at 'filePath' starting from 'offset'.
+func (client *B2Client) DownloadFileRange(threadIndex int, filePath string, offset int64) (io.ReadCloser, int64, error) {
+
+	headers := make(map[string]string)
+	if offset > 0 {
+		headers["Range"] = fmt.Sprintf("bytes=%d-", offset)
+	}
+
+	var url string
 	if !strings.HasSuffix(filePath, ".fsl") {
-		url := client.getDownloadURL() + "/file/" + client.BucketName + "/" + B2Escape(client.StorageDir + filePath)
-
-		readCloser, _, len, err := client.call(threadIndex, url, http.MethodGet, make(map[string]string), 0)
-		return readCloser, len, err
-	}
-
-	// We're trying to download a fossil file.  We need to find the file ID of the last 'upload' of the file.
-	filePath = strings.TrimSuffix(filePath, ".fsl")
-	entries, err := client.ListFileNames(threadIndex, filePath, true, true)
-	fileId := ""
-	for _, entry := range entries {
-		if entry.FileName == filePath && entry.Action == "upload" && entry.Size > 0 {
-			fileId = entry.FileID
-			break
+		url = client.getDownloadURL() + "/file/" + client.BucketName + "/" + B2Escape(client.StorageDir + filePath)
+	} else {
+		// We're trying to download a fossil file.  We need to find the file ID of the last 'upload' of the file.
+		trimmedPath := strings.TrimSuffix(filePath, ".fsl")
+		entries, err := client.ListFileNames(threadIndex, trimmedPath, true, true)
+		if err != nil {
+			return nil, 0, err
 		}
+		fileId := ""
+		for _, entry := range entries {
+			if entry.FileName == trimmedPath && entry.Action == "upload" && entry.Size > 0 {
+				fileId = entry.FileID
+				break
+			}
+		}
+		// Proceed with the b2_download_file_by_id call
+		url = client.getAPIURL() + "/b2api/v4/b2_download_file_by_id?fileId=" + fileId
 	}
 
-	// Proceed with the b2_download_file_by_id call
-	url := client.getAPIURL() + "/b2api/v4/b2_download_file_by_id?fileId=" + fileId
-	readCloser, _, len, err := client.call(threadIndex, url, http.MethodGet, make(map[string]string), 0)
-	return readCloser, len, err
+	readCloser, respHeaders, length, statusCode, err := client.callWithStatus(threadIndex, url, http.MethodGet, headers, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	if offset > 0 && (statusCode != http.StatusPartialContent || !isValidContentRange(respHeaders.Get("Content-Range"), offset)) {
+		readCloser.Close()
+		return nil, 0, ErrRangeNotSupported
+	}
+	return readCloser, length, nil
 }
 
 type B2GetUploadArgumentOutput struct {

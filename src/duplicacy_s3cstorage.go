@@ -5,6 +5,8 @@
 package duplicacy
 
 import (
+	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gilbertchen/goamz/aws"
@@ -167,6 +169,35 @@ func (storage *S3CStorage) DownloadFile(threadIndex int, filePath string, chunk 
 	defer readCloser.Close()
 
 	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/len(storage.buckets))
+	return err
+
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *S3CStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	if offset <= 0 {
+		return storage.DownloadFile(threadIndex, filePath, chunk)
+	}
+
+	headers := map[string][]string{
+		"Range": {fmt.Sprintf("bytes=%d-", offset)},
+	}
+
+	response, err := storage.buckets[threadIndex].GetResponseWithHeaders(storage.storageDir+filePath, headers)
+	if err != nil {
+		if e, ok := err.(*s3.Error); ok && e.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return ErrRangeNotSatisfiable
+		}
+		return err
+	}
+
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusPartialContent || !isValidContentRange(response.Header.Get("Content-Range"), offset) {
+		return ErrRangeNotSupported
+	}
+
+	_, err = RateLimitedCopy(chunk, response.Body, storage.DownloadRateLimit/len(storage.buckets))
 	return err
 
 }

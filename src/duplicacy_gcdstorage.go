@@ -794,6 +794,11 @@ func (storage *GCDStorage) GetFileInfo(threadIndex int, filePath string) (exist 
 
 // DownloadFile reads the file at 'filePath' into the chunk.
 func (storage *GCDStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
+	return storage.DownloadFileRange(threadIndex, filePath, 0, chunk)
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *GCDStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
 	// We never download the fossil so there is no need to convert the path
 	fileID, err := storage.getIDFromPath(threadIndex, storage.convertFilePath(filePath), false)
 	if err != nil {
@@ -815,7 +820,13 @@ func (storage *GCDStorage) DownloadFile(threadIndex int, filePath string, chunk 
 				req = req.AcknowledgeAbuse(true)
 			}
 		}
+		if offset > 0 {
+			req.Header().Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		}
 		response, err = req.Download()
+		if e, ok := err.(*googleapi.Error); ok && e.Code == http.StatusRequestedRangeNotSatisfiable {
+			return ErrRangeNotSatisfiable
+		}
 		if retry, retry_err := storage.shouldRetry(threadIndex, err); retry_err == nil && !retry {
 			break
 		} else if retry {
@@ -826,6 +837,10 @@ func (storage *GCDStorage) DownloadFile(threadIndex int, filePath string, chunk 
 	}
 
 	defer response.Body.Close()
+
+	if offset > 0 && (response.StatusCode != http.StatusPartialContent || !isValidContentRange(response.Header.Get("Content-Range"), offset)) {
+		return ErrRangeNotSupported
+	}
 
 	_, err = RateLimitedCopy(chunk, response.Body, storage.DownloadRateLimit/storage.numberOfThreads)
 	return err

@@ -6,24 +6,25 @@ package duplicacy
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 
-	"github.com/gilbertchen/azure-sdk-for-go/storage"
+	azureblob "github.com/gilbertchen/azure-sdk-for-go/storage"
 )
 
 type AzureStorage struct {
 	StorageBase
 
-	containers []*storage.Container
+	containers []*azureblob.Container
 }
 
 func CreateAzureStorage(accountName string, accountKey string,
 	containerName string, threads int) (azureStorage *AzureStorage, err error) {
 
-	var containers []*storage.Container
+	var containers []*azureblob.Container
 	for i := 0; i < threads; i++ {
 
-		client, err := storage.NewBasicClient(accountName, accountKey)
+		client, err := azureblob.NewBasicClient(accountName, accountKey)
 
 		if err != nil {
 			return nil, err
@@ -69,7 +70,7 @@ func (azureStorage *AzureStorage) ListFiles(threadIndex int, dir string) (files 
 	}
 	dirLength := len(dir)
 
-	parameters := storage.ListBlobsParameters{
+	parameters := azureblob.ListBlobsParameters{
 		Prefix:    dir,
 		Delimiter: "",
 	}
@@ -155,6 +156,32 @@ func (storage *AzureStorage) GetFileInfo(threadIndex int, filePath string) (exis
 func (storage *AzureStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
 	readCloser, err := storage.containers[threadIndex].GetBlobReference(filePath).Get(nil)
 	if err != nil {
+		return err
+	}
+
+	defer readCloser.Close()
+
+	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/len(storage.containers))
+	return err
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *AzureStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	if offset <= 0 {
+		return storage.DownloadFile(threadIndex, filePath, chunk)
+	}
+
+	blobRange := &azureblob.BlobRange{
+		Start: uint64(offset),
+		End:   0,
+	}
+
+	readCloser, err := storage.containers[threadIndex].GetBlobReference(filePath).GetRange(
+		&azureblob.GetBlobRangeOptions{Range: blobRange})
+	if err != nil {
+		if e, ok := err.(azureblob.AzureStorageServiceError); ok && e.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return ErrRangeNotSatisfiable
+		}
 		return err
 	}
 

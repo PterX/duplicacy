@@ -61,14 +61,27 @@ func CreateWebDAVStorage(host string, port int, username string, password string
 		storageDir: "",
 		useHTTP:    useHTTP,
 
-		client:         http.DefaultClient,
+		client:         &http.Client{},
 		threads:        threads,
 		directoryCache: make(map[string]int),
 	}
 
-	// Make sure it doesn't follow redirect
+	// Do not follow 301 redirects (used by WebDAV servers to indicate directories),
+	// while still following 302/307/308 redirects (e.g., aliyunpan download redirects).
 	storage.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
+		if req.Response != nil && req.Response.StatusCode == http.StatusMovedPermanently {
+			return http.ErrUseLastResponse
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		// fix aliyunpan 302
+		// LOG_INFO("debug", "Request: %s", req.URL.Host)
+		if strings.Contains(req.URL.Host, "aliyundrive") {
+			req.Header.Set("Referer", "https://www.aliyundrive.com/")
+			req.Header.Del("Authorization")
+		}
+		return nil
 	}
 
 	exist, isDir, _, err := storage.GetFileInfo(0, storageDir)
@@ -115,7 +128,12 @@ func (storage *WebDAVStorage) retry(backoff int) int {
 	return backoff
 }
 
-func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, data []byte) (io.ReadCloser, http.Header, error) {
+func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, data []byte, extraHeaders ...map[string]string) (io.ReadCloser, http.Header, error) {
+	body, header, _, err := storage.sendRequestWithStatus(method, uri, depth, data, extraHeaders...)
+	return body, header, err
+}
+
+func (storage *WebDAVStorage) sendRequestWithStatus(method string, uri string, depth int, data []byte, extraHeaders ...map[string]string) (io.ReadCloser, http.Header, int, error) {
 
 	backoff := 1
 	for i := 0; i < 8; i++ {
@@ -145,7 +163,7 @@ func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, 
 
 		request, err := http.NewRequest(method, storage.createConnectionString(uri), dataReader)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, 0, err
 		}
 
 		if len(storage.username) > 0 {
@@ -154,6 +172,12 @@ func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, 
 
 		for key, value := range headers {
 			request.Header.Set(key, value)
+		}
+
+		for _, extraHeader := range extraHeaders {
+			for key, value := range extraHeader {
+				request.Header.Set(key, value)
+			}
 		}
 
 		if method == "PUT" {
@@ -171,28 +195,30 @@ func (storage *WebDAVStorage) sendRequest(method string, uri string, depth int, 
 		}
 
 		if response.StatusCode < 300 {
-			return response.Body, response.Header, nil
+			return response.Body, response.Header, response.StatusCode, nil
 		}
 
 		io.Copy(ioutil.Discard, response.Body)
 		response.Body.Close()
 
 		if response.StatusCode == 301 {
-			return nil, nil, errWebDAVMovedPermanently
+			return nil, nil, response.StatusCode, errWebDAVMovedPermanently
 		}
 
 		if response.StatusCode == 404 {
 			// Retry if it is UPLOAD, otherwise return immediately
 			if method != "PUT" {
-				return nil, nil, errWebDAVNotExist
+				return nil, nil, response.StatusCode, errWebDAVNotExist
 			}
 		} else if response.StatusCode == 405 {
-			return nil, nil, errWebDAVMethodNotAllowed
+			return nil, nil, response.StatusCode, errWebDAVMethodNotAllowed
+		} else if response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return nil, nil, response.StatusCode, ErrRangeNotSatisfiable
 		}
 		LOG_INFO("WEBDAV_RETRY", "URL request '%s %s' returned status code %d", method, uri, response.StatusCode)
 		backoff = storage.retry(backoff)
 	}
-	return nil, nil, errWebDAVMaximumBackoff
+	return nil, nil, 0, errWebDAVMaximumBackoff
 }
 
 type WebDAVProperties map[string]string
@@ -447,6 +473,29 @@ func (storage *WebDAVStorage) DownloadFile(threadIndex int, filePath string, chu
 	readCloser, _, err := storage.sendRequest("GET", filePath, 0, nil)
 	if err != nil {
 		return err
+	}
+	defer readCloser.Close()
+
+	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/storage.threads)
+	return err
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *WebDAVStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	if offset <= 0 {
+		return storage.DownloadFile(threadIndex, filePath, chunk)
+	}
+
+	headers := make(map[string]string)
+	headers["Range"] = fmt.Sprintf("bytes=%d-", offset)
+	readCloser, respHeaders, statusCode, err := storage.sendRequestWithStatus("GET", filePath, 0, nil, headers)
+	if err != nil {
+		return err
+	}
+	defer readCloser.Close()
+
+	if statusCode != http.StatusPartialContent || !isValidContentRange(respHeaders.Get("Content-Range"), offset) {
+		return ErrRangeNotSupported
 	}
 
 	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/storage.threads)

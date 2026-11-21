@@ -225,11 +225,19 @@ func (storage *FileFabricStorage) sendRequest(threadIndex int, method string, re
 		}
 
 		if response.StatusCode < 300 {
+			if requestHeaders != nil && requestHeaders["Range"] != "" && response.StatusCode != http.StatusPartialContent {
+				response.Body.Close()
+				return nil, nil, 0, ErrRangeNotSupported
+			}
 			return response.Body, response.Header, response.ContentLength, nil
 		}
 
 		defer response.Body.Close()
-		defer io.Copy(ioutil.Discard, response.Body)	
+		defer io.Copy(ioutil.Discard, response.Body)
+
+		if response.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			return nil, nil, 0, ErrRangeNotSatisfiable
+		}
 
 		var output struct {
 			Status string `xml:"status"`
@@ -553,7 +561,32 @@ func (storage *FileFabricStorage) DownloadFile(threadIndex int, filePath string,
 	}
 
 	defer readCloser.Close()
-	defer io.Copy(ioutil.Discard, readCloser)	
+	defer io.Copy(ioutil.Discard, readCloser)
+	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/storage.threads)
+	return err
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *FileFabricStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	if offset <= 0 {
+		return storage.DownloadFile(threadIndex, filePath, chunk)
+	}
+
+	formData := url.Values { "fi_id" : {storage.storageDir + filePath}}
+
+	headers := make(map[string]string)
+	headers["Range"] = fmt.Sprintf("bytes=%d-", offset)
+
+	readCloser, respHeaders, _, err := storage.sendRequest(threadIndex, http.MethodPost, storage.getAPIURL("getFile"), headers, formData)
+	if err != nil {
+		return err
+	}
+
+	defer readCloser.Close()
+	defer io.Copy(ioutil.Discard, readCloser)
+	if !isValidContentRange(respHeaders.Get("Content-Range"), offset) {
+		return ErrRangeNotSupported
+	}
 	_, err = RateLimitedCopy(chunk, readCloser, storage.DownloadRateLimit/storage.threads)
 	return err
 }

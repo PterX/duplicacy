@@ -6,6 +6,7 @@ package duplicacy
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"time"
@@ -146,4 +147,35 @@ func TestRateLimit(t *testing.T) {
 	actualRate = float64(len(content)) / elapsed.Seconds() / 1024
 	t.Logf("Elapsed time: %s, actual rate: %.3f kB/s, expected rate: %d kB/s", elapsed, actualRate, expectedRate)
 
+}
+
+func TestIsTransientNetworkError(t *testing.T) {
+
+	if IsTransientNetworkError(nil) {
+		t.Errorf("nil should not be a transient network error")
+		return
+	}
+
+	if IsTransientNetworkError(fmt.Errorf("The specified key does not exist")) {
+		t.Errorf("A missing key should not be a transient network error")
+		return
+	}
+
+	transientErrors := []error{
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		fmt.Errorf("wrapped eof: %w", io.EOF),
+		fmt.Errorf("wrapped unexpected eof: %w", io.ErrUnexpectedEOF),
+		fmt.Errorf("read tcp 1.2.3.4:12345->5.6.7.8:443: read: connection reset by peer"),
+		fmt.Errorf("Get https://example.com/chunk: dial tcp: i/o timeout"),
+		fmt.Errorf("stream error: stream ID 1; INTERNAL_ERROR"),
+		fmt.Errorf("unexpected EOF"),
+	}
+
+	for _, err := range transientErrors {
+		if !IsTransientNetworkError(err) {
+			t.Errorf("The error '%v' should be classified as a transient network error", err)
+			return
+		}
+	}
 }

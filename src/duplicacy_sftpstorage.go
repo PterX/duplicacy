@@ -264,6 +264,12 @@ func (storage *SFTPStorage) GetFileInfo(threadIndex int, filePath string) (exist
 
 // DownloadFile reads the file at 'filePath' into the chunk.
 func (storage *SFTPStorage) DownloadFile(threadIndex int, filePath string, chunk *Chunk) (err error) {
+	return storage.DownloadFileRange(threadIndex, filePath, 0, chunk)
+}
+
+// DownloadFileRange appends to the chunk the content of the file at 'filePath' starting from 'offset'.
+func (storage *SFTPStorage) DownloadFileRange(threadIndex int, filePath string, offset int64, chunk *Chunk) (err error) {
+	currentOffset := offset
 	return storage.retry(func() error {
 		file, err := storage.getSFTPClient().Open(path.Join(storage.storageDir, filePath))
 
@@ -272,10 +278,16 @@ func (storage *SFTPStorage) DownloadFile(threadIndex int, filePath string, chunk
 		}
 
 		defer file.Close()
-		if _, err = RateLimitedCopy(chunk, file, storage.DownloadRateLimit/storage.numberOfThreads); err != nil {
-			return err
+
+		if currentOffset > 0 {
+			if _, err = file.Seek(currentOffset, io.SeekStart); err != nil {
+				return err
+			}
 		}
-		return nil
+
+		n, err := RateLimitedCopy(chunk, file, storage.DownloadRateLimit/storage.numberOfThreads)
+		currentOffset += n
+		return err
 	})
 }
 
