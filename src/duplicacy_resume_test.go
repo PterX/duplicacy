@@ -1124,3 +1124,67 @@ func TestRestoreResumeProgressHashModeSkippedFile(t *testing.T) {
 		}
 	}
 }
+
+func TestRestoreResumeMultiThreadTrailingSkippedFilesNoDeadlock(t *testing.T) {
+	setTestingT(t)
+
+	// file1 is chunk-aligned or variable; file2 and file3 share a boundary chunk so AddFiles
+	// marks that shared chunk as needed=true. Deleting only file1 leaves trailing skipped files
+	// whose shared chunk must not trigger a deadlock under threads > 1 in either quickMode or -hash mode.
+	files := []struct {
+		name string
+		size int
+	}{
+		{"a_file1", 200 * 1024},
+		{"b_file2", 30 * 1024},
+		{"c_file3", 200 * 1024},
+	}
+	srcRepo, dstRepo, _, storage := setupRestoreResumeTestEnv(t, files, false)
+
+	SetDuplicacyPreferencePath(path.Join(dstRepo, ".duplicacy"))
+	bm := CreateBackupManager("resume-test", storage, dstRepo, "", "", "", false)
+	bm.SetupSnapshotCache("default")
+	bm.SetDataChunkCaching(true)
+
+	// Initial full restore
+	if failed := bm.Restore(dstRepo, 1, true, true, 4, true, false, false, false, nil, false); failed != 0 {
+		t.Fatalf("initial restore failed: %d", failed)
+	}
+
+	// Case 1: quickMode=true with threads=4, only a_file1 deleted (trailing b_file2 & c_file3 skipped).
+	os.Remove(path.Join(dstRepo, "a_file1"))
+	done := make(chan int, 1)
+	go func() {
+		done <- bm.Restore(dstRepo, 1, true, true, 4, true, false, false, true, nil, false)
+	}()
+	select {
+	case failed := <-done:
+		if failed != 0 {
+			t.Fatalf("quickMode multi-thread resume failed: %d", failed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("deadlock detected in quickMode multi-thread restore with trailing skipped files")
+	}
+
+	// Case 2: quickMode=false (-hash) with threads=4, only a_file1 deleted.
+	os.Remove(path.Join(dstRepo, "a_file1"))
+	done2 := make(chan int, 1)
+	go func() {
+		done2 <- bm.Restore(dstRepo, 1, true, false, 4, true, false, false, true, nil, false)
+	}()
+	select {
+	case failed := <-done2:
+		if failed != 0 {
+			t.Fatalf("hashMode multi-thread resume failed: %d", failed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("deadlock detected in hashMode multi-thread restore with trailing skipped files")
+	}
+
+	// Verify all files (including skipped ones) are present and match original hashes.
+	for _, f := range files {
+		if getFileHash(path.Join(srcRepo, f.name)) != getFileHash(path.Join(dstRepo, f.name)) {
+			t.Errorf("restored file %s hash mismatch", f.name)
+		}
+	}
+}

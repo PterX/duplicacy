@@ -869,6 +869,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 		skippedChunkCount := 0
 		for i := range chunkDownloader.taskList {
 			if !chunkNeededByUnskipped[i] {
+				chunkDownloader.taskList[i].needed = false
 				chunkDownloader.MarkSkippedChunk(i)
 				skippedChunkCount++
 			}
@@ -959,7 +960,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 		file.RestoreMetadata(fullPath, nil, setOwner)
 	}
 
-	chunkDownloader.Reclaim(len(chunkDownloader.taskList))
+	chunkDownloader.Finish()
 
 	if deleteMode && len(patterns) == 0 {
 		// Reverse the order to make sure directories are empty before being deleted

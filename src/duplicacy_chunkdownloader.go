@@ -246,6 +246,19 @@ func (downloader *ChunkDownloader) WaitForChunk(chunkIndex int) (chunk *Chunk) {
 	return downloader.taskList[chunkIndex].chunk
 }
 
+// Finish drains any in-flight prefetched downloads and reclaims all remaining chunks so that
+// worker goroutines never block on completionChannel when ChunkOperator.Stop() is called.
+func (downloader *ChunkDownloader) Finish() {
+	for downloader.numberOfDownloadingChunks > 0 {
+		completion := <-downloader.completionChannel
+		downloader.completedTasks[completion.chunkIndex] = true
+		downloader.taskList[completion.chunkIndex].chunk = completion.chunk
+		downloader.numberOfDownloadedChunks++
+		downloader.numberOfDownloadingChunks--
+	}
+	downloader.Reclaim(len(downloader.taskList))
+}
+
 // WaitForCompletion waits until all chunks have been downloaded
 func (downloader *ChunkDownloader) WaitForCompletion() {
 
