@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -734,5 +735,392 @@ func TestOneDriveClientDownloadRange(t *testing.T) {
 	_, _, err = client.DownloadFileRange("chunks/abc", int64(len(content)))
 	if !errors.Is(err, ErrRangeNotSatisfiable) {
 		t.Fatalf("expected ErrRangeNotSatisfiable, got %v", err)
+	}
+}
+
+type capturedLogEntry struct {
+	level   int
+	logID   string
+	message string
+}
+
+func captureLogs(t *testing.T, fn func()) []capturedLogEntry {
+	t.Helper()
+	var mu sync.Mutex
+	var entries []capturedLogEntry
+	origLogFunc := LogFunction
+	origLevel := loggingLevel
+	SetLoggingLevel(INFO)
+	LogFunction = func(level int, logID string, message string) {
+		mu.Lock()
+		entries = append(entries, capturedLogEntry{level: level, logID: logID, message: message})
+		mu.Unlock()
+		if level > WARN {
+			panic(Exception{Level: level, LogID: logID, Message: message})
+		}
+	}
+	defer func() {
+		LogFunction = origLogFunc
+		SetLoggingLevel(origLevel)
+	}()
+	fn()
+	return entries
+}
+
+func writeDeterministicFile(t *testing.T, filePath string, size int, seed uint64) {
+	t.Helper()
+	data := make([]byte, size)
+	state := seed*6364136223846793005 + 1442695040888963407
+	for i := range data {
+		state = state*6364136223846793005 + 1442695040888963407
+		data[i] = byte(state >> 56)
+	}
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		t.Fatalf("failed to write %s: %v", filePath, err)
+	}
+}
+
+func setupRestoreResumeTestEnv(t *testing.T, files []struct {
+	name string
+	size int
+}, fixedChunkSize bool) (string, string, string, *FileStorage) {
+	t.Helper()
+	baseDir := t.TempDir()
+	srcRepo := path.Join(baseDir, "src_repo")
+	dstRepo := path.Join(baseDir, "dst_repo")
+	storageDir := path.Join(baseDir, "storage")
+	os.MkdirAll(path.Join(srcRepo, ".duplicacy"), 0700)
+	os.MkdirAll(path.Join(dstRepo, ".duplicacy"), 0700)
+	os.MkdirAll(storageDir, 0700)
+
+	for idx, f := range files {
+		full := path.Join(srcRepo, f.name)
+		os.MkdirAll(path.Dir(full), 0700)
+		writeDeterministicFile(t, full, f.size, uint64(idx+1))
+	}
+
+	storage, err := CreateFileStorage(storageDir, false, 1)
+	if err != nil {
+		t.Fatalf("CreateFileStorage failed: %v", err)
+	}
+	for _, dir := range []string{"chunks", "snapshots"} {
+		if err := storage.CreateDirectory(0, dir); err != nil {
+			t.Fatalf("CreateDirectory %s failed: %v", dir, err)
+		}
+	}
+	if fixedChunkSize {
+		if !ConfigStorage(storage, 16384, 100, 64*1024, 64*1024, 64*1024, "", nil, false, "", 0, 0) {
+			t.Fatalf("ConfigStorage (fixed) failed")
+		}
+	} else {
+		if !ConfigStorage(storage, 16384, 100, 64*1024, 256*1024, 16*1024, "", nil, false, "", 0, 0) {
+			t.Fatalf("ConfigStorage (variable) failed")
+		}
+	}
+
+	SetDuplicacyPreferencePath(path.Join(srcRepo, ".duplicacy"))
+	bm := CreateBackupManager("resume-test", storage, srcRepo, "", "", "", false)
+	bm.SetupSnapshotCache("default")
+	if !bm.Backup(srcRepo, true, 1, "init", false, false, 0, false, 1024, 1024) {
+		t.Fatalf("Backup failed")
+	}
+
+	return srcRepo, dstRepo, storageDir, storage
+}
+
+var (
+	reDownloadedProgress = regexp.MustCompile(`^Downloaded chunk (\d+)/(\d+) size (\d+), .* ([0-9.]+)%$`)
+	reCachedProgress     = regexp.MustCompile(`^Cached chunk (\d+)/(\d+) size (\d+), ([0-9.]+)%$`)
+)
+
+func TestRestoreResumeProgressWithSkippedFilesAndChunkCache(t *testing.T) {
+	setTestingT(t)
+
+	// Variable chunking packs file1, file2, file3 continuously so file1 and file2 share a boundary chunk.
+	files := []struct {
+		name string
+		size int
+	}{
+		{"file1", 400 * 1024},
+		{"file2", 400 * 1024},
+		{"file3", 400 * 1024},
+	}
+	srcRepo, dstRepo, _, storage := setupRestoreResumeTestEnv(t, files, false)
+
+	SetDuplicacyPreferencePath(path.Join(dstRepo, ".duplicacy"))
+	bm := CreateBackupManager("resume-test", storage, dstRepo, "", "", "", false)
+	bm.SetupSnapshotCache("default")
+	bm.SetDataChunkCaching(true)
+
+	// First run: restore everything to populate files and local chunk cache.
+	firstLogs := captureLogs(t, func() {
+		failed := bm.Restore(dstRepo, 1, true, true, 1, true, false, false, true, nil, false)
+		if failed != 0 {
+			t.Fatalf("initial restore failed with %d errors", failed)
+		}
+	})
+
+	totalChunks := 0
+	for _, entry := range firstLogs {
+		if entry.logID == "DOWNLOAD_PROGRESS" {
+			if m := reDownloadedProgress.FindStringSubmatch(entry.message); m != nil {
+				totalChunks, _ = strconv.Atoi(m[2])
+			}
+		}
+	}
+	if totalChunks < 10 {
+		t.Fatalf("expected >= 10 total chunks in snapshot, got %d", totalChunks)
+	}
+
+	// Simulate an interrupted restore right after file1 finished:
+	// - file1 stays intact on disk (will be skipped by quickMode)
+	// - file2 and file3 are removed from disk
+	// - keep ONLY file1's chunks (including the boundary chunk shared with file2) in the local cache,
+	//   deleting later data chunks from the local cache so file2's shared boundary chunk hits cache
+	//   and the following chunks must be downloaded from remote storage.
+	// Previously this caused file2 to be re-indexed starting from 0, silently loading the shared
+	// chunk (index 0) from cache and logging "Downloaded chunk 2 ... 2.x%".
+	os.Remove(path.Join(dstRepo, "file2"))
+	os.Remove(path.Join(dstRepo, "file3"))
+
+	snap := bm.SnapshotManager.DownloadSnapshot("resume-test", 1)
+	bm.SnapshotManager.DownloadSnapshotSequences(snap)
+	var file1EndChunk, file2StartChunk int
+	metaOp := CreateChunkOperator(bm.config, storage, bm.snapshotCache, false, false, 1, false)
+	snap.ListRemoteFiles(bm.config, metaOp, func(e *Entry) bool {
+		if e.Path == "file1" {
+			file1EndChunk = e.EndChunk
+		} else if e.Path == "file2" {
+			file2StartChunk = e.StartChunk
+		}
+		return true
+	})
+	metaOp.Stop()
+
+	if file1EndChunk != file2StartChunk {
+		t.Fatalf("expected file1 and file2 to share a boundary chunk, got file1.EndChunk=%d file2.StartChunk=%d",
+			file1EndChunk, file2StartChunk)
+	}
+	for i := file1EndChunk + 1; i < len(snap.ChunkHashes); i++ {
+		chunkID := bm.config.GetChunkIDFromHash(snap.ChunkHashes[i])
+		if cachedPath, exist, _, err := bm.snapshotCache.FindChunk(0, chunkID, false, false); err == nil && exist {
+			bm.snapshotCache.DeleteFile(0, cachedPath)
+		}
+	}
+
+	// Second run: restart restore from breakpoint.
+	resumeLogs := captureLogs(t, func() {
+		failed := bm.Restore(dstRepo, 1, true, true, 1, true, false, false, true, nil, false)
+		if failed != 0 {
+			t.Fatalf("resumed restore failed with %d errors", failed)
+		}
+	})
+
+	sawResumeLog := false
+	firstCachedIdx := -1
+	firstDownloadedIdx := -1
+	firstDownloadedPct := 0.0
+	lastDownloadedIdx := -1
+	lastDownloadedPct := 0.0
+
+	for _, entry := range resumeLogs {
+		if entry.logID == "RESTORE_RESUME" {
+			sawResumeLog = true
+		}
+		if entry.logID == "DOWNLOAD_PROGRESS" {
+			if m := reCachedProgress.FindStringSubmatch(entry.message); m != nil {
+				idx, _ := strconv.Atoi(m[1])
+				tot, _ := strconv.Atoi(m[2])
+				if tot != totalChunks {
+					t.Errorf("cached progress totalChunks = %d, want %d", tot, totalChunks)
+				}
+				if firstCachedIdx == -1 {
+					firstCachedIdx = idx
+				}
+			}
+			if m := reDownloadedProgress.FindStringSubmatch(entry.message); m != nil {
+				idx, _ := strconv.Atoi(m[1])
+				tot, _ := strconv.Atoi(m[2])
+				pct, _ := strconv.ParseFloat(m[4], 64)
+				if tot != totalChunks {
+					t.Errorf("download progress totalChunks = %d, want %d", tot, totalChunks)
+				}
+				if firstDownloadedIdx == -1 {
+					firstDownloadedIdx = idx
+					firstDownloadedPct = pct
+				}
+				lastDownloadedIdx = idx
+				lastDownloadedPct = pct
+			}
+		}
+	}
+
+	if !sawResumeLog {
+		t.Errorf("expected RESTORE_RESUME log message when resuming with skipped files")
+	}
+	expectedSharedChunk := file1EndChunk + 1 // 1-based chunk index of shared boundary chunk
+	if firstCachedIdx != expectedSharedChunk {
+		t.Errorf("expected first cached chunk to be %d/%d, got %d", expectedSharedChunk, totalChunks, firstCachedIdx)
+	}
+	expectedFirstDownload := expectedSharedChunk + 1
+	if firstDownloadedIdx != expectedFirstDownload {
+		t.Errorf("expected first downloaded chunk to be %d/%d (not 2!), got %d", expectedFirstDownload, totalChunks, firstDownloadedIdx)
+	}
+	// file1 is ~33% of total size plus 1 new chunk -> percentage must reflect true progress (> 33%), not ~5%.
+	if firstDownloadedPct < 33.0 {
+		t.Errorf("expected first downloaded chunk percentage >= 33%%, got %.1f%%", firstDownloadedPct)
+	}
+	if lastDownloadedIdx != totalChunks || lastDownloadedPct != 100.0 {
+		t.Errorf("expected final progress %d/%d at 100.0%%, got %d/%d at %.1f%%", totalChunks, totalChunks, lastDownloadedIdx, totalChunks, lastDownloadedPct)
+	}
+
+	for _, f := range files {
+		if getFileHash(path.Join(srcRepo, f.name)) != getFileHash(path.Join(dstRepo, f.name)) {
+			t.Errorf("restored file %s hash mismatch", f.name)
+		}
+	}
+}
+
+func TestRestoreResumeProgressInPlacePartialFile(t *testing.T) {
+	setTestingT(t)
+
+	// Single 640KB file -> 10 fixed 64KB chunks.
+	files := []struct {
+		name string
+		size int
+	}{
+		{"bigfile", 10 * 64 * 1024},
+	}
+	srcRepo, dstRepo, _, storage := setupRestoreResumeTestEnv(t, files, true)
+
+	SetDuplicacyPreferencePath(path.Join(dstRepo, ".duplicacy"))
+	bm := CreateBackupManager("resume-test", storage, dstRepo, "", "", "", false)
+	bm.SetupSnapshotCache("default")
+	// Chunk cache disabled: test pure in-place local disk resume.
+	bm.SetDataChunkCaching(false)
+
+	// Pre-populate dstRepo/bigfile with the first 4 chunks (256KB) to simulate an interrupted restore.
+	srcBytes, err := os.ReadFile(path.Join(srcRepo, "bigfile"))
+	if err != nil {
+		t.Fatalf("read src bigfile: %v", err)
+	}
+	if err := os.WriteFile(path.Join(dstRepo, "bigfile"), srcBytes[:4*64*1024], 0644); err != nil {
+		t.Fatalf("write partial bigfile: %v", err)
+	}
+
+	logs := captureLogs(t, func() {
+		failed := bm.Restore(dstRepo, 1, true, true, 1, true, false, false, true, nil, false)
+		if failed != 0 {
+			t.Fatalf("in-place resumed restore failed with %d errors", failed)
+		}
+	})
+
+	sawResumeLog := false
+	firstIdx := -1
+	firstPct := 0.0
+	lastIdx := -1
+	lastPct := 0.0
+
+	for _, entry := range logs {
+		if entry.logID == "RESTORE_RESUME" && strings.Contains(entry.message, "4/10 chunks") {
+			sawResumeLog = true
+		}
+		if entry.logID == "DOWNLOAD_PROGRESS" {
+			if m := reDownloadedProgress.FindStringSubmatch(entry.message); m != nil {
+				idx, _ := strconv.Atoi(m[1])
+				tot, _ := strconv.Atoi(m[2])
+				pct, _ := strconv.ParseFloat(m[4], 64)
+				if tot != 10 {
+					t.Errorf("totalChunks = %d, want 10", tot)
+				}
+				if firstIdx == -1 {
+					firstIdx = idx
+					firstPct = pct
+				}
+				lastIdx = idx
+				lastPct = pct
+			}
+		}
+	}
+
+	if !sawResumeLog {
+		t.Errorf("expected RESTORE_RESUME log mentioning 4/10 chunks already exist locally")
+	}
+	if firstIdx != 5 || firstPct != 50.0 {
+		t.Errorf("expected first downloaded chunk 5/10 at 50.0%%, got %d/10 at %.1f%%", firstIdx, firstPct)
+	}
+	if lastIdx != 10 || lastPct != 100.0 {
+		t.Errorf("expected final downloaded chunk 10/10 at 100.0%%, got %d/10 at %.1f%%", lastIdx, lastPct)
+	}
+	if getFileHash(path.Join(srcRepo, "bigfile")) != getFileHash(path.Join(dstRepo, "bigfile")) {
+		t.Errorf("restored bigfile hash mismatch")
+	}
+}
+
+func TestRestoreResumeProgressHashModeSkippedFile(t *testing.T) {
+	setTestingT(t)
+
+	// Two chunk-aligned 320KB files (5 chunks each = 10 chunks total).
+	files := []struct {
+		name string
+		size int
+	}{
+		{"a_file1", 5 * 64 * 1024},
+		{"b_file2", 5 * 64 * 1024},
+	}
+	srcRepo, dstRepo, _, storage := setupRestoreResumeTestEnv(t, files, true)
+
+	SetDuplicacyPreferencePath(path.Join(dstRepo, ".duplicacy"))
+	bm := CreateBackupManager("resume-test", storage, dstRepo, "", "", "", false)
+	bm.SetupSnapshotCache("default")
+	bm.SetDataChunkCaching(false)
+
+	// Restore full snapshot once, then delete b_file2 while keeping a_file1.
+	if failed := bm.Restore(dstRepo, 1, true, true, 1, true, false, false, false, nil, false); failed != 0 {
+		t.Fatalf("initial restore failed: %d", failed)
+	}
+	os.Remove(path.Join(dstRepo, "b_file2"))
+
+	// Resume in -hash mode (quickMode=false): a_file1 is skipped by hash inside RestoreFile.
+	logs := captureLogs(t, func() {
+		failed := bm.Restore(dstRepo, 1, true, false, 1, true, false, false, true, nil, false)
+		if failed != 0 {
+			t.Fatalf("hash-mode resumed restore failed: %d", failed)
+		}
+	})
+
+	firstIdx := -1
+	firstPct := 0.0
+	lastIdx := -1
+	lastPct := 0.0
+	for _, entry := range logs {
+		if entry.logID == "DOWNLOAD_PROGRESS" {
+			if m := reDownloadedProgress.FindStringSubmatch(entry.message); m != nil {
+				idx, _ := strconv.Atoi(m[1])
+				tot, _ := strconv.Atoi(m[2])
+				pct, _ := strconv.ParseFloat(m[4], 64)
+				if tot != 10 {
+					t.Errorf("totalChunks = %d, want 10", tot)
+				}
+				if firstIdx == -1 {
+					firstIdx = idx
+					firstPct = pct
+				}
+				lastIdx = idx
+				lastPct = pct
+			}
+		}
+	}
+
+	if firstIdx != 6 || firstPct != 60.0 {
+		t.Errorf("expected first downloaded chunk 6/10 at 60.0%%, got %d/10 at %.1f%%", firstIdx, firstPct)
+	}
+	if lastIdx != 10 || lastPct != 100.0 {
+		t.Errorf("expected final downloaded chunk 10/10 at 100.0%%, got %d/10 at %.1f%%", lastIdx, lastPct)
+	}
+	for _, f := range files {
+		if getFileHash(path.Join(srcRepo, f.name)) != getFileHash(path.Join(dstRepo, f.name)) {
+			t.Errorf("restored file %s hash mismatch", f.name)
+		}
 	}
 }

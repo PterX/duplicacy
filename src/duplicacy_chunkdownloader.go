@@ -5,7 +5,6 @@
 package duplicacy
 
 import (
-	"sync/atomic"
 	"time"
 )
 
@@ -17,6 +16,7 @@ type ChunkDownloadTask struct {
 	chunkLength   int    // The length of the chunk; may be zero
 	needed        bool   // Whether this chunk can be skipped if a local copy exists
 	isDownloading bool   // 'true' means the chunk has been downloaded or is being downloaded
+	isAccounted   bool   // 'true' means this chunk has been accounted as skipped in progress tracking
 }
 
 type ChunkDownloadCompletion struct {
@@ -95,7 +95,20 @@ func (downloader *ChunkDownloader) AddFiles(snapshot *Snapshot, files []*Entry) 
 			maximumChunks = file.EndChunk - file.StartChunk
 		}
 	}
-	downloader.operator.totalChunkSize = downloader.totalChunkSize
+	downloader.operator.ResetDownloadProgress(len(downloader.taskList), downloader.totalChunkSize)
+}
+
+// MarkSkippedChunk accounts for a chunk that will not be downloaded (either because it belongs
+// only to already-restored skipped files or already exists locally in a partially restored file).
+func (downloader *ChunkDownloader) MarkSkippedChunk(chunkIndex int) {
+	if chunkIndex < 0 || chunkIndex >= len(downloader.taskList) {
+		return
+	}
+	task := &downloader.taskList[chunkIndex]
+	if !task.isDownloading && !task.isAccounted {
+		task.isAccounted = true
+		downloader.operator.AddSkippedChunk(int64(task.chunkLength))
+	}
 }
 
 // Prefetch adds up to 'threads' chunks needed by a file to the download list
@@ -112,6 +125,11 @@ func (downloader *ChunkDownloader) Prefetch(file *Entry) {
 					return
 				}
 
+				if task.isAccounted {
+					task.isAccounted = false
+					downloader.operator.AddSkippedChunk(-int64(task.chunkLength))
+				}
+
 				LOG_DEBUG("DOWNLOAD_PREFETCH", "Prefetching %s chunk %s", file.Path,
 					downloader.operator.config.GetChunkIDFromHash(task.chunkHash))
 				downloader.operator.DownloadAsync(task.chunkHash, i, false, func (chunk *Chunk, chunkIndex int) {
@@ -122,6 +140,9 @@ func (downloader *ChunkDownloader) Prefetch(file *Entry) {
 				downloader.numberOfActiveChunks++
 			}
 		} else {
+			if i < file.EndChunk || i == len(downloader.taskList)-1 {
+				downloader.MarkSkippedChunk(i)
+			}
 			LOG_DEBUG("DOWNLOAD_PREFETCH", "%s chunk %s is not needed", file.Path,
 				downloader.operator.config.GetChunkIDFromHash(task.chunkHash))
 		}
@@ -131,6 +152,9 @@ func (downloader *ChunkDownloader) Prefetch(file *Entry) {
 // Reclaim releases the downloaded chunk to the chunk pool
 func (downloader *ChunkDownloader) Reclaim(chunkIndex int) {
 
+	if chunkIndex > len(downloader.taskList) {
+		chunkIndex = len(downloader.taskList)
+	}
 	if downloader.lastChunkIndex >= chunkIndex {
 		return
 	}
@@ -148,7 +172,7 @@ func (downloader *ChunkDownloader) Reclaim(chunkIndex int) {
 		// These chunks are never downloaded if 'isDownloading' is false; note that 'isDownloading' isn't reset to
 		// false after a chunk has been downloaded
 		if !downloader.taskList[i].isDownloading {
-			atomic.AddInt64(&downloader.totalChunkSize, -int64(downloader.taskList[i].chunkLength))
+			downloader.MarkSkippedChunk(i)
 		}
 	}
 	downloader.lastChunkIndex = chunkIndex
@@ -172,6 +196,10 @@ func (downloader *ChunkDownloader) WaitForChunk(chunkIndex int) (chunk *Chunk) {
 
 	// If we haven't started download the specified chunk, download it now
 	if !downloader.taskList[chunkIndex].isDownloading {
+		if downloader.taskList[chunkIndex].isAccounted {
+			downloader.taskList[chunkIndex].isAccounted = false
+			downloader.operator.AddSkippedChunk(-int64(downloader.taskList[chunkIndex].chunkLength))
+		}
 		LOG_DEBUG("DOWNLOAD_FETCH", "Fetching chunk %s",
 			downloader.operator.config.GetChunkIDFromHash(downloader.taskList[chunkIndex].chunkHash))
 		downloader.operator.DownloadAsync(downloader.taskList[chunkIndex].chunkHash, chunkIndex, false, func (chunk *Chunk, chunkIndex int) {
@@ -193,6 +221,10 @@ func (downloader *ChunkDownloader) WaitForChunk(chunkIndex int) (chunk *Chunk) {
 		}
 
 		if !task.isDownloading {
+			if task.isAccounted {
+				task.isAccounted = false
+				downloader.operator.AddSkippedChunk(-int64(task.chunkLength))
+			}
 			LOG_DEBUG("DOWNLOAD_PREFETCH", "Prefetching chunk %s", downloader.operator.config.GetChunkIDFromHash(task.chunkHash))
 			downloader.operator.DownloadAsync(task.chunkHash, task.chunkIndex, false, func (chunk *Chunk, chunkIndex int) {
 				downloader.completionChannel <- ChunkDownloadCompletion { chunk: chunk, chunkIndex: chunkIndex }

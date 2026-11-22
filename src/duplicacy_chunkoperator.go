@@ -55,9 +55,13 @@ type ChunkOperator struct {
 	fossils []string             // For fossilize operation, the paths of the fossils are stored in this slice
 	collectionLock *sync.Mutex   // The lock for accessing 'fossils'
 
-	startTime int64              // The time it starts downloading
-	totalChunkSize int64         // Total chunk size
-	downloadedChunkSize int64    // Downloaded chunk size
+	startTime                 int64 // The time it starts downloading
+	remoteDownloadStartTime   int64 // The time the first remote data chunk download starts
+	totalChunkSize            int64 // Total chunk size
+	totalChunks               int   // Total number of chunks in the restore task list
+	downloadedChunkSize       int64 // Completed chunk size (skipped + cached + remotely downloaded)
+	remoteDownloadedChunkSize int64 // Chunk size actually downloaded from remote storage
+	cachedChunkCount          int64 // Number of data chunks loaded from the local cache
 
 	allowFailures bool           // Whether to fail on download error, or continue
 	cacheDataChunks bool         // Whether to cache downloaded data chunks in the snapshot cache
@@ -111,6 +115,25 @@ func CreateChunkOperator(config *Config, storage Storage, snapshotCache *FileSto
 // Note that the cached chunks are stored unencrypted.
 func (operator *ChunkOperator) EnableDataChunkCache() {
 	operator.cacheDataChunks = true
+}
+
+// ResetDownloadProgress initializes total chunk progress counters for a restore operation.
+func (operator *ChunkOperator) ResetDownloadProgress(totalChunks int, totalChunkSize int64) {
+	operator.totalChunks = totalChunks
+	atomic.StoreInt64(&operator.totalChunkSize, totalChunkSize)
+	atomic.StoreInt64(&operator.downloadedChunkSize, 0)
+	atomic.StoreInt64(&operator.remoteDownloadedChunkSize, 0)
+	atomic.StoreInt64(&operator.cachedChunkCount, 0)
+	atomic.StoreInt64(&operator.remoteDownloadStartTime, 0)
+}
+
+// AddSkippedChunk accounts for a chunk that does not need to be downloaded (e.g., belongs to a
+// skipped file or already exists locally in an existing file) so that restore progress percentage
+// reflects the true position across the entire restore.
+func (operator *ChunkOperator) AddSkippedChunk(chunkSize int64) {
+	if chunkSize != 0 {
+		atomic.AddInt64(&operator.downloadedChunkSize, chunkSize)
+	}
 }
 
 func (operator *ChunkOperator) Stop() {
@@ -351,11 +374,26 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 				} else {
 					LOG_DEBUG("CHUNK_CACHE", "Chunk %s has been loaded from the local cache", chunkID)
 
-					// A data chunk loaded from the local cache counts as downloaded so that the
+					// A data chunk loaded from the local cache counts as completed so that the
 					// progress percentage keeps advancing and can reach 100% (metadata chunks are
 					// excluded from totalChunkSize during restore).
 					if !task.isMetadata {
-						atomic.AddInt64(&operator.downloadedChunkSize, int64(chunk.GetLength()))
+						atomic.AddInt64(&operator.cachedChunkCount, 1)
+						completedChunkSize := atomic.AddInt64(&operator.downloadedChunkSize, int64(chunk.GetLength()))
+						totalChunkSize := atomic.LoadInt64(&operator.totalChunkSize)
+						if (operator.showStatistics || IsTracing()) && totalChunkSize > 0 {
+							if completedChunkSize > totalChunkSize {
+								completedChunkSize = totalChunkSize
+							}
+							percentage := float32(completedChunkSize * 1000 / totalChunkSize)
+							if operator.totalChunks > 0 {
+								LOG_INFO("DOWNLOAD_PROGRESS", "Cached chunk %d/%d size %d, %.1f%%",
+									task.chunkIndex+1, operator.totalChunks, chunk.GetLength(), percentage/10)
+							} else {
+								LOG_INFO("DOWNLOAD_PROGRESS", "Cached chunk %d size %d, %.1f%%",
+									task.chunkIndex+1, chunk.GetLength(), percentage/10)
+							}
+						}
 					}
 
 					task.completionFunc(chunk, task.chunkIndex)
@@ -388,6 +426,9 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 	const MaxDownloadAttempts = 3
 	const MaxStalledResumes = 3
 	const MaxTotalResumes = 16
+	if !task.isMetadata {
+		atomic.CompareAndSwapInt64(&operator.remoteDownloadStartTime, 0, time.Now().Unix())
+	}
 	for downloadAttempt := 0; ; downloadAttempt++ {
 
 		exist := false
@@ -591,23 +632,42 @@ func (operator *ChunkOperator) DownloadChunk(threadIndex int, task ChunkTask) {
 		}
 	}
 
-	downloadedChunkSize := atomic.AddInt64(&operator.downloadedChunkSize, int64(chunk.GetLength()))
+	if !task.isMetadata {
+		completedChunkSize := atomic.AddInt64(&operator.downloadedChunkSize, int64(chunk.GetLength()))
+		remoteDownloadedSize := atomic.AddInt64(&operator.remoteDownloadedChunkSize, int64(chunk.GetLength()))
+		totalChunkSize := atomic.LoadInt64(&operator.totalChunkSize)
 
-	if (operator.showStatistics || IsTracing()) && operator.totalChunkSize > 0 {
-
-		now := time.Now().Unix()
-		if now <= operator.startTime {
-			now = operator.startTime + 1
+		if (operator.showStatistics || IsTracing()) && totalChunkSize > 0 {
+			startTime := atomic.LoadInt64(&operator.remoteDownloadStartTime)
+			if startTime == 0 {
+				startTime = operator.startTime
+			}
+			now := time.Now().Unix()
+			if now <= startTime {
+				now = startTime + 1
+			}
+			speed := remoteDownloadedSize / (now - startTime)
+			if completedChunkSize > totalChunkSize {
+				completedChunkSize = totalChunkSize
+			}
+			remainingSize := totalChunkSize - completedChunkSize
+			remainingTime := int64(0)
+			if speed > 0 && remainingSize > 0 {
+				remainingTime = remainingSize/speed + 1
+			}
+			percentage := float32(completedChunkSize * 1000 / totalChunkSize)
+			if operator.totalChunks > 0 {
+				LOG_INFO("DOWNLOAD_PROGRESS", "Downloaded chunk %d/%d size %d, %sB/s %s %.1f%%",
+					task.chunkIndex+1, operator.totalChunks, chunk.GetLength(),
+					PrettySize(speed), PrettyTime(remainingTime), percentage/10)
+			} else {
+				LOG_INFO("DOWNLOAD_PROGRESS", "Downloaded chunk %d size %d, %sB/s %s %.1f%%",
+					task.chunkIndex+1, chunk.GetLength(),
+					PrettySize(speed), PrettyTime(remainingTime), percentage/10)
+			}
+		} else {
+			LOG_DEBUG("CHUNK_DOWNLOAD", "Chunk %s has been downloaded", chunkID)
 		}
-		speed := downloadedChunkSize / (now - operator.startTime)
-		remainingTime := int64(0)
-		if speed > 0 {
-			remainingTime = (operator.totalChunkSize-downloadedChunkSize)/speed + 1
-		}
-		percentage := float32(downloadedChunkSize * 1000 / operator.totalChunkSize)
-		LOG_INFO("DOWNLOAD_PROGRESS", "Downloaded chunk %d size %d, %sB/s %s %.1f%%",
-			task.chunkIndex+1, chunk.GetLength(),
-			PrettySize(speed), PrettyTime(remainingTime), percentage/10)
 	} else {
 		LOG_DEBUG("CHUNK_DOWNLOAD", "Chunk %s has been downloaded", chunkID)
 	}

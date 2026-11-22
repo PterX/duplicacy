@@ -676,6 +676,7 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 
 	// These will store files/directories to be downloaded.
 	fileEntries := make([]*Entry, 0)
+	skippedEntries := make(map[*Entry]bool)
 	directoryEntries := make([]*Entry, 0)
 
 	var totalFileSize int64
@@ -751,10 +752,13 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 		}
 
 		if compareResult == 0 {
-			if quickMode && localEntry.IsFile() && localEntry.IsSameAs(remoteEntry) {
+			if quickMode && localEntry.IsFile() && remoteEntry.IsFile() && localEntry.IsSameAs(remoteEntry) {
 				LOG_TRACE("RESTORE_SKIP", "File %s unchanged (by size and timestamp)", localEntry.Path)
 				skippedFileSize += localEntry.Size
 				skippedFileCount++
+				skippedEntries[remoteEntry] = true
+				fileEntries = append(fileEntries, remoteEntry)
+				totalFileSize += remoteEntry.Size
 				localEntry = nil
 				continue
 			}
@@ -851,12 +855,41 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 
 	chunkDownloader.AddFiles(remoteSnapshot, fileEntries)
 
+	if len(skippedEntries) > 0 && len(chunkDownloader.taskList) > 0 {
+		chunkNeededByUnskipped := make([]bool, len(chunkDownloader.taskList))
+		for _, file := range fileEntries {
+			if file.Size == 0 || skippedEntries[file] {
+				continue
+			}
+			for i := file.StartChunk; i <= file.EndChunk; i++ {
+				chunkNeededByUnskipped[i] = true
+			}
+		}
+
+		skippedChunkCount := 0
+		for i := range chunkDownloader.taskList {
+			if !chunkNeededByUnskipped[i] {
+				chunkDownloader.MarkSkippedChunk(i)
+				skippedChunkCount++
+			}
+		}
+
+		LOG_INFO("RESTORE_RESUME", "Resuming restore: skipping %d/%d unchanged file(s) (%s bytes, %d/%d chunks already present)",
+			skippedFileCount, len(fileEntries), PrettySize(skippedFileSize), skippedChunkCount, len(chunkDownloader.taskList))
+	} else if len(skippedEntries) > 0 {
+		LOG_INFO("RESTORE_RESUME", "Resuming restore: skipping %d/%d unchanged file(s) (%s bytes)",
+			skippedFileCount, len(fileEntries), PrettySize(skippedFileSize))
+	}
+
 	chunkMaker := CreateFileChunkMaker(manager.config, true)
 
 	startDownloadingTime := time.Now().Unix()
 
 	// Now download files one by one
 	for _, file := range fileEntries {
+		if skippedEntries[file] {
+			continue
+		}
 
 		fullPath := joinPath(top, file.Path)
 		stat, _ := os.Stat(fullPath)
@@ -926,6 +959,8 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 		file.RestoreMetadata(fullPath, nil, setOwner)
 	}
 
+	chunkDownloader.Reclaim(len(chunkDownloader.taskList))
+
 	if deleteMode && len(patterns) == 0 {
 		// Reverse the order to make sure directories are empty before being deleted
 		for i := range extraFiles {
@@ -954,8 +989,14 @@ func (manager *BackupManager) Restore(top string, revision int, inPlace bool, qu
 	LOG_INFO("RESTORE_END", "Restored %s to revision %d", top, revision)
 	if showStatistics {
 		LOG_INFO("RESTORE_STATS", "Files: %d total, %s bytes", len(fileEntries), PrettySize(totalFileSize))
-		LOG_INFO("RESTORE_STATS", "Downloaded %d file, %s bytes, %d chunks",
-			len(downloadedFiles), PrettySize(downloadedFileSize), chunkDownloader.numberOfDownloadedChunks)
+		cachedChunks := atomic.LoadInt64(&chunkOperator.cachedChunkCount)
+		if cachedChunks > 0 {
+			LOG_INFO("RESTORE_STATS", "Downloaded %d file, %s bytes, %d chunks (%d from cache)",
+				len(downloadedFiles), PrettySize(downloadedFileSize), chunkDownloader.numberOfDownloadedChunks, cachedChunks)
+		} else {
+			LOG_INFO("RESTORE_STATS", "Downloaded %d file, %s bytes, %d chunks",
+				len(downloadedFiles), PrettySize(downloadedFileSize), chunkDownloader.numberOfDownloadedChunks)
+		}
 		LOG_INFO("RESTORE_STATS", "Skipped %d file, %s bytes", skippedFileCount, PrettySize(skippedFileSize))
 	}
 
@@ -1375,9 +1416,55 @@ func (manager *BackupManager) RestoreFile(chunkDownloader *ChunkDownloader, chun
 		}
 	}
 
-	for i := entry.StartChunk; i <= entry.EndChunk; i++ {
-		if _, found := offsetMap[chunkDownloader.taskList[i].chunkHash]; !found {
-			chunkDownloader.taskList[i].needed = true
+	localReuseCount := 0
+	var localReuseSize int64
+	if inPlace {
+		j := 0
+		scanOffset := int64(0)
+		scanExistingOffset := int64(0)
+		for i := entry.StartChunk; i <= entry.EndChunk; i++ {
+			for scanExistingOffset < scanOffset && j < len(existingChunks) {
+				scanExistingOffset += int64(existingLengths[j])
+				j++
+			}
+			hash := chunkDownloader.taskList[i].chunkHash
+			start := 0
+			if i == entry.StartChunk {
+				start = entry.StartOffset
+			}
+			end := chunkDownloader.taskList[i].chunkLength
+			if i == entry.EndChunk {
+				end = entry.EndOffset
+			}
+			if scanExistingOffset == scanOffset && start == 0 && j < len(existingChunks) &&
+				end == existingLengths[j] && existingChunks[j] == hash {
+				localReuseCount++
+				localReuseSize += int64(chunkDownloader.taskList[i].chunkLength)
+			} else {
+				chunkDownloader.taskList[i].needed = true
+			}
+			scanOffset += int64(end - start)
+		}
+	} else {
+		for i := entry.StartChunk; i <= entry.EndChunk; i++ {
+			if _, found := offsetMap[chunkDownloader.taskList[i].chunkHash]; !found {
+				chunkDownloader.taskList[i].needed = true
+			} else {
+				localReuseCount++
+				localReuseSize += int64(chunkDownloader.taskList[i].chunkLength)
+			}
+		}
+	}
+
+	if localReuseCount > 0 {
+		if !isNewFile {
+			LOG_INFO("RESTORE_RESUME", "Resuming %s: %d/%d chunks (%s bytes) already exist locally",
+				entry.Path, localReuseCount, entry.EndChunk-entry.StartChunk+1, PrettySize(localReuseSize))
+		}
+		for i := entry.StartChunk; i <= entry.EndChunk; i++ {
+			if !chunkDownloader.taskList[i].needed && (i < entry.EndChunk || i == len(chunkDownloader.taskList)-1) {
+				chunkDownloader.MarkSkippedChunk(i)
+			}
 		}
 	}
 
